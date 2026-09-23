@@ -1,0 +1,19 @@
+services:
+  dedup-service:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      KOMMO_SUBDOMAIN: ${KOMMO_SUBDOMAIN}
+      KOMMO_LONG_LIVED_TOKEN: ${KOMMO_LONG_LIVED_TOKEN}
+      KOMMO_WEBHOOK_SECRET: ${KOMMO_WEBHOOK_SECRET}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+      DATABASE_URL: /data/dedup.sqlite
+      PORT: 3000
+      DEFAULT_COUNTRY_CODE: ${DEFAULT_COUNTRY_CODE:-54}
+    volumes:
+      - dedup-data:/data
+    restart: unless-stopped
+
+volumes:
+  dedup-data:
