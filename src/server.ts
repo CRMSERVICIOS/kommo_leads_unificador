@@ -1,7 +1,8 @@
 import express from "express";
 import { config } from "./config";
-import { getDb } from "./db";
+import { runMigrations } from "./db";
 import { logger } from "./logger";
+import { adminRouter } from "./routes/admin";
 import { healthRouter } from "./routes/health";
 import { duplicatesRouter } from "./routes/duplicates";
 import { webhooksRouter } from "./routes/webhooks";
@@ -19,6 +20,7 @@ app.use(express.json());
 app.use("/health", healthRouter);
 app.use("/duplicates", duplicatesRouter);
 app.use("/webhooks", webhooksRouter);
+app.use("/admin", adminRouter);
 
 app.use(
   (
@@ -35,8 +37,16 @@ app.use(
   }
 );
 
-getDb(); // inicializa el archivo sqlite y corre schema.sql si hace falta
+async function start(): Promise<void> {
+  await runMigrations(); // crea las tablas si no existen
+  app.listen(config.port, () => {
+    logger.info("server_started", { port: config.port });
+  });
+}
 
-app.listen(config.port, () => {
-  logger.info("server_started", { port: config.port });
+start().catch((err) => {
+  logger.error("server_start_failed", {
+    error: err instanceof Error ? err.message : String(err),
+  });
+  process.exit(1);
 });

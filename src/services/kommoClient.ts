@@ -47,71 +47,222 @@ async function kommoFetch<T>(
   return JSON.parse(text) as T;
 }
 
-export interface KommoContactSearchResult {
-  id: number;
-  name: string;
-  // TODO: completar con los campos que realmente necesitemos una vez que
-  // verifiquemos la respuesta real de GET /api/v4/contacts?query=...
-  [key: string]: unknown;
+/** Contacto de Kommo reducido a lo que usa el indice de telefonos. */
+export interface KommoContactPhones {
+  id: string;
+  /** Valores crudos del campo PHONE (sin normalizar). */
+  phones: string[];
+  leadIds: string[];
+}
+
+interface KommoContactsResponse {
+  _embedded?: {
+    contacts?: Array<{
+      id: number | string;
+      custom_fields_values?: Array<{
+        field_code?: string | null;
+        values?: Array<{ value?: string }>;
+      }> | null;
+      _embedded?: { leads?: Array<{ id: number | string }> };
+    }>;
+  };
+  _links?: { next?: { href?: string } };
+}
+
+function toContactPhones(data: KommoContactsResponse | undefined): KommoContactPhones[] {
+  return (data?._embedded?.contacts ?? []).map((contact) => ({
+    id: String(contact.id),
+    phones: (contact.custom_fields_values ?? [])
+      .filter((field) => field.field_code === "PHONE")
+      .flatMap((field) => field.values ?? [])
+      .map((v) => v.value)
+      .filter((v): v is string => !!v),
+    leadIds: (contact._embedded?.leads ?? []).map((lead) => String(lead.id)),
+  }));
 }
 
 /**
- * Busca contactos en Kommo por texto libre (Kommo permite buscar por
- * telefono/email usando el parametro `query`). Se usa solo como
- * enriquecimiento/validacion manual; la deteccion principal de duplicados
- * se apoya en nuestro propio `phone_index`, no en este buscador.
+ * Busca contactos en Kommo por texto (`query` busca en nombre, telefono,
+ * email...). Relanza si Kommo responde error. Responde 204 sin body cuando no
+ * hay resultados.
  *
- * TODO: verificar contra la cuenta real si `query` matchea telefonos en
- * cualquier formato o si hay que mandarlo en un formato especifico.
+ * Confirmado contra la cuenta real: buscar el telefono completo NO cruza
+ * formatos ("+5493777808738" no encuentra "+543777808738"), pero buscar los
+ * ultimos digitos si encuentra ambos. El que llama tiene que filtrar los
+ * resultados normalizando los telefonos.
+ *   GET /api/v4/contacts?query=77808738&with=leads
  */
-export async function searchContactsByPhone(
-  phone: string
-): Promise<KommoContactSearchResult[]> {
-  const path = `/contacts?query=${encodeURIComponent(phone)}`;
-  try {
-    const data = await kommoFetch<{ _embedded?: { contacts?: KommoContactSearchResult[] } }>(
-      path
-    );
-    return data._embedded?.contacts ?? [];
-  } catch (err) {
-    logger.error("kommo_search_contacts_failed", {
-      phone,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return [];
-  }
+export async function findContactsByPhoneQuery(query: string): Promise<KommoContactPhones[]> {
+  const data = await kommoFetch<KommoContactsResponse | undefined>(
+    `/contacts?query=${encodeURIComponent(query)}&with=leads&limit=250`
+  );
+  return toContactPhones(data);
+}
+
+/**
+ * Una pagina del listado completo de contactos (para el backfill del
+ * indice). Relanza si Kommo responde error.
+ *   GET /api/v4/contacts?page=N&limit=250&with=leads
+ */
+export async function listContactsPage(
+  page: number,
+  limit = 250
+): Promise<{ contacts: KommoContactPhones[]; hasMore: boolean }> {
+  const data = await kommoFetch<KommoContactsResponse | undefined>(
+    `/contacts?page=${page}&limit=${limit}&with=leads`
+  );
+  return { contacts: toContactPhones(data), hasMore: !!data?._links?.next?.href };
+}
+
+/**
+ * Devuelve los ids de los leads vinculados a un contacto. Relanza si Kommo
+ * responde error.
+ *   GET /api/v4/contacts/{id}?with=leads -> _embedded.leads[].id
+ */
+export async function getContactLeadIds(contactId: string): Promise<string[]> {
+  const data = await kommoFetch<{ _embedded?: { leads?: { id: number | string }[] } }>(
+    `/contacts/${contactId}?with=leads`
+  );
+  return (data._embedded?.leads ?? []).map((lead) => String(lead.id));
+}
+
+export interface KommoLeadSummary {
+  id: number;
+  pipeline_id: number;
+  status_id: number;
+  closed_at?: number | null;
+  [key: string]: unknown;
+}
+
+/** GET /api/v4/leads/{id}. Relanza si Kommo responde error. */
+export async function getLead(leadId: string): Promise<KommoLeadSummary> {
+  return kommoFetch<KommoLeadSummary>(`/leads/${leadId}`);
+}
+
+/**
+ * Mueve un lead a una etapa y devuelve la respuesta cruda de Kommo. Relanza
+ * si Kommo responde error.
+ *
+ * Se manda SIEMPRE `pipeline_id` junto con `status_id`: las etapas de
+ * sistema 142 (ganado) y 143 (perdido) existen con el mismo id en todos los
+ * embudos, y la receta de la doc ("Move a lead to another stage") manda los
+ * dos. Pasando el embudo actual del lead, el lead no cambia de embudo.
+ *   PATCH /api/v4/leads/{id}  { "pipeline_id": 123, "status_id": 143, "loss_reason_id": 456 }
+ * `loss_reason_id` es opcional ("Lead loss reason ID" en la doc); los motivos
+ * se crean desde la UI de Kommo (la API v4 solo permite listarlos).
+ */
+export async function updateLeadStatus(
+  leadId: string,
+  pipelineId: number,
+  statusId: number,
+  lossReasonId?: number | null
+): Promise<unknown> {
+  return kommoFetch(`/leads/${leadId}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      pipeline_id: pipelineId,
+      status_id: statusId,
+      ...(lossReasonId ? { loss_reason_id: lossReasonId } : {}),
+    }),
+  });
 }
 
 export type KommoEntityType = "leads" | "contacts";
 
 /**
- * Agrega una nota de texto simple a un lead o contacto.
+ * Crea una nota de texto ("common") en un lead o contacto y devuelve la
+ * respuesta cruda de Kommo. Relanza si Kommo responde error.
  *
- * TODO: verificar el shape exacto contra la API real. Segun la doc v4,
- * el endpoint espera un ARRAY de notas en el body, ej:
- *   POST /api/v4/leads/{id}/notes
- *   [{ "note_type": "common", "params": { "text": "..." } }]
- * Ajustar si la cuenta real requiere otro `note_type` o estructura de
- * `params` distinta.
+ * Confirmado contra la doc v4 (developers.kommo.com/reference/add-notes):
+ *   POST /api/v4/{leads|contacts}/notes
+ *   [{ "entity_id": 123, "note_type": "common", "params": { "text": "..." } }]
+ */
+export async function createNote(
+  entityType: KommoEntityType,
+  entityId: string,
+  text: string
+): Promise<unknown> {
+  const body = [
+    {
+      entity_id: Number(entityId),
+      note_type: "common",
+      params: { text },
+    },
+  ];
+
+  return kommoFetch(`/${entityType}/notes`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Agrega tags a un lead o contacto SIN tocar los que ya tiene, y devuelve
+ * la respuesta cruda de Kommo. Relanza si Kommo responde error.
+ *
+ * Confirmado contra la doc v4 (developers.kommo.com/reference/updating-single-lead):
+ * `_embedded.tags` REEMPLAZA la lista completa de tags ("If already attached
+ * tags are not passed, they will be detached"); `tags_to_add` solo agrega.
+ *   PATCH /api/v4/leads/{id}
+ *   { "tags_to_add": [{ "name": "duplicado-potencial" }] }
+ */
+export async function addTagsToEntity(
+  entityType: KommoEntityType,
+  entityId: string,
+  tagNames: string[]
+): Promise<unknown> {
+  const body = {
+    tags_to_add: tagNames.map((name) => ({ name })),
+  };
+
+  return kommoFetch(`/${entityType}/${entityId}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Vincula un contacto a un lead YA EXISTENTE y devuelve la respuesta cruda
+ * de Kommo. Relanza si Kommo responde error.
+ *
+ * Confirmado contra la doc v4 (developers.kommo.com/reference/linking-entities):
+ *   POST /api/v4/leads/{lead_id}/link
+ *   [{ "to_entity_id": 123, "to_entity_type": "contacts", "metadata": { "is_main": true } }]
+ * Responde 200 con `_embedded.links`. PATCH /leads con `_embedded.contacts`
+ * NO esta soportado para leads existentes (solo acepta `_embedded.tags`).
+ * Vincular NO desvincula los contactos que el lead ya tenia; para eso hay
+ * un endpoint aparte (POST /api/v4/leads/{id}/unlink).
+ */
+export async function linkContactToLead(
+  leadId: string,
+  contactId: string,
+  options: { isMain: boolean }
+): Promise<unknown> {
+  const body = [
+    {
+      to_entity_id: Number(contactId),
+      to_entity_type: "contacts",
+      metadata: { is_main: options.isMain },
+    },
+  ];
+
+  return kommoFetch(`/leads/${leadId}/link`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Agrega una nota de texto simple a un lead o contacto (best-effort: loguea
+ * y no relanza si falla).
  */
 export async function addNote(
   entityType: KommoEntityType,
   entityId: string,
   text: string
 ): Promise<void> {
-  const path = `/${entityType}/${entityId}/notes`;
-  const body = [
-    {
-      note_type: "common",
-      params: { text },
-    },
-  ];
-
   try {
-    await kommoFetch(path, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
+    await createNote(entityType, entityId, text);
     logger.info("kommo_note_added", { entityType, entityId });
   } catch (err) {
     logger.error("kommo_add_note_failed", {
@@ -126,34 +277,16 @@ export async function addNote(
 }
 
 /**
- * Agrega un tag a un lead (Kommo tambien soporta tags en contactos con el
- * mismo shape).
- *
- * TODO: verificar contra la API real. Segun doc v4, se actualiza via
- *   PATCH /api/v4/leads/{id}
- *   { "_embedded": { "tags": [{ "name": "duplicado-potencial" }] } }
- * OJO: esto podria PISAR los tags existentes en vez de agregar, dependiendo
- * de como Kommo interprete el PATCH parcial. Confirmar con la cuenta real
- * si hace falta primero hacer GET del lead para mergear los tags actuales
- * antes de mandar el PATCH.
+ * Agrega un tag a un lead o contacto sin pisar los existentes (best-effort:
+ * loguea y no relanza si falla).
  */
 export async function addTag(
   entityType: KommoEntityType,
   entityId: string,
   tagName: string
 ): Promise<void> {
-  const path = `/${entityType}/${entityId}`;
-  const body = {
-    _embedded: {
-      tags: [{ name: tagName }],
-    },
-  };
-
   try {
-    await kommoFetch(path, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    });
+    await addTagsToEntity(entityType, entityId, [tagName]);
     logger.info("kommo_tag_added", { entityType, entityId, tagName });
   } catch (err) {
     logger.error("kommo_add_tag_failed", {

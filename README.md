@@ -33,7 +33,7 @@ que la deteccion (Fase 1) funciona bien y no genera falsos positivos.
    canonico (ver `src/services/phoneNormalizer.ts` para el detalle de las
    reglas argentinas: codigo de pais, "9" de celular, "15" viejo, "0" de
    area).
-3. Busca ese telefono normalizado en su propio indice (`phone_index`, SQLite).
+3. Busca ese telefono normalizado en su propio indice (`phone_index`, Postgres).
 4. Si es nuevo: lo guarda en el indice y no hace nada mas.
 5. Si ya existe asociado a OTRO contacto/lead: dispara el flujo de aviso
    descripto arriba y lo registra en `duplicate_detections`.
@@ -55,13 +55,36 @@ Otros comandos:
 ```bash
 npm run build       # compila TypeScript a dist/
 npm start           # corre la version compilada
-npm test            # corre los tests (vitest)
+npm run test:db:up  # levanta Postgres local (docker compose, puerto 5433, bases dedup y dedup_test)
+npm test            # corre los tests (vitest); los de tests/db.postgres.test.ts usan dedup_test
 npm run typecheck   # chequeo de tipos sin emitir output
+npm run db:migrate  # crea las tablas en DATABASE_URL (tambien se corre solo al arrancar)
 ```
 
 El servidor levanta por defecto en `http://localhost:3000` (configurable con
-`PORT`). La base SQLite se crea automaticamente (archivo + schema) en la
-primera corrida, en la ruta indicada por `DATABASE_URL`.
+`PORT`). Las tablas se crean automaticamente en el Postgres de `DATABASE_URL`
+al arrancar (`schema.sql` es idempotente).
+
+### Carga inicial del indice (backfill)
+
+Una sola vez, antes de activar el modo automatico en produccion, cargar en
+`phone_index` los telefonos de todos los contactos que ya existen en Kommo
+(solo indexa: no registra detecciones ni fusiona):
+
+```bash
+npm run backfill-index -- --dry-run   # solo cuenta, no escribe
+npm run backfill-index                # local
+node dist/jobs/backfillIndex.js       # en produccion (imagen compilada)
+```
+
+Se puede correr mas de una vez sin duplicar filas. Ademas, si llega un
+telefono que no esta en el indice, el detector lo busca en Kommo antes de
+darlo por nuevo (webhooks perdidos). El ganador de una fusion es siempre el
+contacto con id de Kommo mas bajo (el mas viejo); si el orden no cierra, la
+deteccion queda en `pending_review` con el motivo en `notes`.
+
+Para pasar datos de una instalacion vieja con SQLite:
+`scripts/migrate-sqlite-to-postgres.sh ./data/dedup.sqlite "$DATABASE_URL"`.
 
 ### Con Docker
 
@@ -79,7 +102,11 @@ Ver `.env.example`. Resumen:
 | `KOMMO_LONG_LIVED_TOKEN` | Token de integracion privada (long-lived token) de Kommo. **Pendiente de completar.** |
 | `KOMMO_WEBHOOK_SECRET` | Secreto para validar la firma del webhook, si Kommo la provee. **Pendiente de confirmar si aplica** (ver TODO en `src/middleware/verifyKommoWebhook.ts`). |
 | `SLACK_WEBHOOK_URL` | URL de un Incoming Webhook de Slack. Opcional: si no esta seteado, solo se loguea. |
-| `DATABASE_URL` | Path al archivo SQLite. Default `./data/dedup.sqlite`. |
+| `DATABASE_URL` | Connection string de Postgres, ej. `postgresql://user:pass@host:25060/db?sslmode=require`. Obligatoria. |
+| `DATABASE_CA_CERT` | CA del Postgres administrado (en DO App Platform: `${<db>.CA_CERT}`). Opcional: sin ella la conexion va cifrada pero sin verificar la CA. |
+| `DRY_RUN` | Freno de emergencia. `true` = solo loguea los duplicados, sin fusionar. Default `false`. |
+| `KOMMO_DUPLICATE_LOSS_REASON_ID` | Motivo de perdida con el que se cierra el lead duplicado. |
+| `ADMIN_TOKEN` | Token para `POST /admin/unify-test`. Vacio = deshabilitado. |
 | `PORT` | Puerto HTTP. Default `3000`. |
 | `DEFAULT_COUNTRY_CODE` | Codigo de pais por defecto para telefonos sin codigo explicito. Default `54` (Argentina). |
 
@@ -193,7 +220,7 @@ src/
     notifier.ts                 # notificaciones (Slack + log)
   db/
     schema.sql                  # DDL de phone_index, duplicate_detections, processed_webhook_events
-    index.ts                    # conexion sqlite + inicializacion de schema
+    index.ts                    # pool de Postgres (pg) + migraciones
     phoneIndex.ts                # acceso a phone_index
     duplicateDetections.ts      # acceso a duplicate_detections
     webhookEvents.ts             # idempotencia de eventos de webhook

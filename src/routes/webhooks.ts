@@ -3,7 +3,7 @@ import path from "path";
 import type { NextFunction, Request, Response } from "express";
 import { Router } from "express";
 import { verifyKommoWebhook } from "../middleware/verifyKommoWebhook";
-import { processIncomingEntity } from "../services/duplicateDetector";
+import { extractLinkedLeadIds, processIncomingEntity } from "../services/duplicateDetector";
 import { logger } from "../logger";
 import type {
   KommoClassicWebhookBody,
@@ -205,11 +205,17 @@ async function processContactEvents(
       continue;
     }
 
+    // El primer lead vinculado se guarda como lead_id del registro (phone_index
+    // y duplicate_detections tienen una sola columna); la nota/tag de
+    // duplicado se aplica a todos los vinculados.
+    const linkedLeadIds = extractLinkedLeadIds(contact.linked_leads_id);
+
     await processIncomingEntity({
       entityType: "contact",
       entityId: contact.id,
       contactId: contact.id,
-      leadId: null,
+      leadId: linkedLeadIds[0] ?? null,
+      linkedLeadIds,
       phonesRaw: phones,
       source,
       rawPayload: contact,
@@ -281,14 +287,35 @@ async function handleKommoWebhookBody(
   return processed;
 }
 
-webhooksRouter.post("/kommo/lead", async (req, res) => {
-  const body = req.body as KommoClassicWebhookBody;
-  const processed = await handleKommoWebhookBody(body, req.query.source);
-  res.status(200).json({ ok: true, processed });
+/**
+ * Kommo exige respuesta 2xx en menos de 2 segundos y desactiva el webhook si
+ * acumula fallas; una fusion tarda varios segundos (5-6 llamadas a la API).
+ * Por eso se responde primero y se procesa despues, en una cola serie: asi
+ * dos eventos del mismo contacto (ej: contacts.add + contacts.update con
+ * 1 segundo de diferencia) nunca disparan dos fusiones en paralelo.
+ */
+let processingQueue: Promise<void> = Promise.resolve();
+
+function enqueueWebhookBody(body: KommoClassicWebhookBody, querySource: unknown): void {
+  processingQueue = processingQueue
+    .then(async () => {
+      const processed = await handleKommoWebhookBody(body, querySource);
+      logger.info("webhook_body_processed", { processed });
+    })
+    .catch((err) => {
+      logger.error("webhook_processing_failed", {
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      });
+    });
+}
+
+webhooksRouter.post("/kommo/lead", (req, res) => {
+  res.status(200).json({ ok: true });
+  enqueueWebhookBody(req.body as KommoClassicWebhookBody, req.query.source);
 });
 
-webhooksRouter.post("/kommo/contact", async (req, res) => {
-  const body = req.body as KommoClassicWebhookBody;
-  const processed = await handleKommoWebhookBody(body, req.query.source);
-  res.status(200).json({ ok: true, processed });
+webhooksRouter.post("/kommo/contact", (req, res) => {
+  res.status(200).json({ ok: true });
+  enqueueWebhookBody(req.body as KommoClassicWebhookBody, req.query.source);
 });

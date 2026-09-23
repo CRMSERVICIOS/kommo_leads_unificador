@@ -1,4 +1,23 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dedup
+      POSTGRES_PASSWORD: dedup
+      POSTGRES_DB: dedup
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      # Crea tambien la base dedup_test para `npm test` (solo en el primer arranque del volumen).
+      - ./scripts/create-test-db.sql:/docker-entrypoint-initdb.d/create-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dedup"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
   dedup-service:
     build: .
     ports:
@@ -7,13 +26,16 @@ services:
       KOMMO_SUBDOMAIN: ${KOMMO_SUBDOMAIN}
       KOMMO_LONG_LIVED_TOKEN: ${KOMMO_LONG_LIVED_TOKEN}
       KOMMO_WEBHOOK_SECRET: ${KOMMO_WEBHOOK_SECRET}
-      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
-      DATABASE_URL: /data/dedup.sqlite
+      KOMMO_DUPLICATE_LOSS_REASON_ID: ${KOMMO_DUPLICATE_LOSS_REASON_ID}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      DRY_RUN: ${DRY_RUN:-false}
+      DATABASE_URL: postgresql://dedup:dedup@postgres:5432/dedup
       PORT: 3000
       DEFAULT_COUNTRY_CODE: ${DEFAULT_COUNTRY_CODE:-54}
-    volumes:
-      - dedup-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  dedup-data:
+  pg-data:

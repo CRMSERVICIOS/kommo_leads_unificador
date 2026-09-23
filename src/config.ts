@@ -7,13 +7,22 @@ export const config = {
   kommoLongLivedToken: process.env.KOMMO_LONG_LIVED_TOKEN || "",
   kommoWebhookSecret: process.env.KOMMO_WEBHOOK_SECRET || "",
   slackWebhookUrl: process.env.SLACK_WEBHOOK_URL || "",
-  databaseUrl: process.env.DATABASE_URL || "./data/dedup.sqlite",
+  // Connection string de Postgres, ej. postgresql://user:pass@host:25060/db?sslmode=require
+  databaseUrl: process.env.DATABASE_URL || "",
+  // CA del Postgres administrado (DO App Platform: ${<db>.CA_CERT}). Opcional.
+  databaseCaCert: process.env.DATABASE_CA_CERT || "",
   port: Number(process.env.PORT || 3000),
   defaultCountryCode: process.env.DEFAULT_COUNTRY_CODE || "54",
-  // Default true: si DRY_RUN no esta seteado, el servicio no escribe nada en
-  // Kommo (solo simula). Hay que setear explicitamente DRY_RUN=false para
-  // habilitar las escrituras reales (addNote/addTag).
-  dryRun: process.env.DRY_RUN !== "false",
+  // Freno de emergencia. Default false (produccion): los duplicados se
+  // fusionan automaticamente. Con DRY_RUN=true el detector solo loguea lo que
+  // haria, sin escribir nada en Kommo.
+  dryRun: process.env.DRY_RUN === "true",
+  // Motivo de perdida con el que se cierra el lead duplicado (GET
+  // /api/v4/leads/loss_reasons para ver los ids). Vacio = cierra sin motivo.
+  duplicateLossReasonId: Number(process.env.KOMMO_DUPLICATE_LOSS_REASON_ID) || null,
+  // Token para las rutas /admin (ej. POST /admin/unify-test). Si esta vacio,
+  // esas rutas quedan deshabilitadas.
+  adminToken: process.env.ADMIN_TOKEN || "",
 };
 
 export function getKommoBaseUrl(): string {

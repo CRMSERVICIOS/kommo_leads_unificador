@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { getDb } from "./index";
+import { getPool } from "./index";
 
 /**
  * Construye una clave de idempotencia a partir del tipo de entidad, su id en
@@ -25,15 +25,11 @@ export function buildEventKey(
  * vez que se ve (hay que procesarlo), o `false` si ya se proceso antes
  * (reintento de Kommo, hay que ignorarlo).
  */
-export function markEventProcessedIfNew(eventKey: string): boolean {
-  const db = getDb();
-  try {
-    db.prepare(
-      `INSERT INTO processed_webhook_events (event_key) VALUES (?)`
-    ).run(eventKey);
-    return true;
-  } catch (err) {
-    // Violacion de UNIQUE constraint => ya estaba procesado.
-    return false;
-  }
+export async function markEventProcessedIfNew(eventKey: string): Promise<boolean> {
+  const result = await getPool().query(
+    `INSERT INTO processed_webhook_events (event_key) VALUES ($1)
+     ON CONFLICT (event_key) DO NOTHING`,
+    [eventKey]
+  );
+  return result.rowCount === 1;
 }
