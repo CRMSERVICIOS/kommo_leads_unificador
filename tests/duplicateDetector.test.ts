@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   getLead: vi.fn(),
   findContactsByPhoneQuery: vi.fn(),
   appendDetectionNote: vi.fn(),
+  loggerInfo: vi.fn(),
+  loggerWarn: vi.fn(),
   loggerError: vi.fn(),
   unifyDuplicate: vi.fn(),
   config: {
@@ -38,7 +40,7 @@ vi.mock("../src/db/duplicateDetections", () => ({
 }));
 
 vi.mock("../src/logger", () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: mocks.loggerError },
+  logger: { info: mocks.loggerInfo, warn: mocks.loggerWarn, error: mocks.loggerError },
 }));
 
 vi.mock("../src/db/webhookEvents", () => ({
@@ -59,6 +61,7 @@ vi.mock("../src/services/duplicateUnifier", async () => {
   return {
     // resolveWinner es la regla de quien gana: se prueba la real.
     DUPLICATES_PIPELINE_ID: actual.DUPLICATES_PIPELINE_ID,
+    DUPLICATES_STATUS_ID: actual.DUPLICATES_STATUS_ID,
     resolveWinner: actual.resolveWinner,
     unifyDuplicate: mocks.unifyDuplicate,
   };
@@ -264,7 +267,6 @@ describe("processIncomingEntity - duplicado que queda en pending_review", () => 
 
     expect(result.duplicatesDetected).toBe(1);
     expect(mocks.insertPhoneIndex).toHaveBeenCalledTimes(1);
-    expect(mocks.getLead).not.toHaveBeenCalled();
     await expectPending("DRY_RUN=true");
   });
 
@@ -474,6 +476,143 @@ describe("processIncomingEntity - varios contactos en el indice local", () => {
 
     expect(mocks.unifyDuplicate).toHaveBeenCalledWith(
       expect.objectContaining({ loserContactId: "40490001", loserLeadId: "22630001" })
+    );
+  });
+});
+
+/** Busca el log con ese `event` en los mocks del logger y devuelve [mensaje, campos]. */
+function findLog(mock: ReturnType<typeof vi.fn>, event: string): [string, Record<string, unknown>] {
+  const call = mock.mock.calls.find((c) => (c[1] as { event?: string } | undefined)?.event === event);
+  expect(call, `no se logueo ${event}`).toBeDefined();
+  return call as [string, Record<string, unknown>];
+}
+
+describe("log explicito de la decision ganador/perdedor", () => {
+  it("indice local, DRY_RUN=true: dice Ganador, Perdedor y el destino, y no ejecuta", async () => {
+    mocks.config.dryRun = true;
+    mocks.findByPhone.mockReturnValue([OTHER_ROW]);
+
+    await processIncomingEntity(BASE_INPUT);
+
+    const [msg, fields] = findLog(mocks.loggerInfo, "duplicate_decision");
+    expect(msg).toBe(
+      "[DRY RUN] Ganador: lead 22630002 / contacto 40490002 (queda intacto). " +
+        "Perdedor: lead 22630001 / contacto 40490001 -> se moveria a pipeline 14517971 status 112145359 " +
+        "y queda vinculado al contacto 40490002 como principal. " +
+        "Telefono 5491122334455, detectado via indice local. No se ejecuta (DRY_RUN=true)."
+    );
+    expect(fields).toMatchObject({
+      dryRun: true,
+      detectedVia: "indice_local",
+      winnerLeadId: "22630002",
+      winnerContactId: "40490002",
+      loserLeadId: "22630001",
+      loserContactId: "40490001",
+      targetPipelineId: 14517971,
+      targetStatusId: 112145359,
+    });
+    expect(mocks.unifyDuplicate).not.toHaveBeenCalled();
+  });
+
+  it("indice local, DRY_RUN=false: mismo log, sin prefijo, y ejecuta", async () => {
+    mocks.findByPhone.mockReturnValue([OTHER_ROW]);
+
+    await processIncomingEntity(BASE_INPUT);
+
+    const [msg] = findLog(mocks.loggerInfo, "duplicate_decision");
+    expect(msg).toBe(
+      "Ganador: lead 22630002 / contacto 40490002 (queda intacto). " +
+        "Perdedor: lead 22630001 / contacto 40490001 -> se mueve a pipeline 14517971 status 112145359 " +
+        "y queda vinculado al contacto 40490002 como principal. " +
+        "Telefono 5491122334455, detectado via indice local. Se ejecuta."
+    );
+    expect(mocks.unifyDuplicate).toHaveBeenCalledTimes(1);
+    // El log de la decision sale antes de escribir en Kommo.
+    const logOrder = mocks.loggerInfo.mock.invocationCallOrder[
+      mocks.loggerInfo.mock.calls.findIndex((c) => (c[1] as { event?: string })?.event === "duplicate_decision")
+    ];
+    expect(logOrder).toBeLessThan(mocks.unifyDuplicate.mock.invocationCallOrder[0]);
+  });
+
+  it("fallback a Kommo: mismo formato, con el contacto de Kommo como ganador si es mas nuevo", async () => {
+    mocks.config.dryRun = true;
+    mocks.findByPhone.mockResolvedValue([]);
+    mocks.findContactsByPhoneQuery.mockResolvedValue([
+      { id: "40499999", phones: ["+5491122334455"], leadIds: ["22639999"] },
+    ]);
+
+    await processIncomingEntity(BASE_INPUT);
+
+    const [msg, fields] = findLog(mocks.loggerInfo, "duplicate_decision");
+    expect(msg).toBe(
+      "[DRY RUN] Ganador: lead 22639999 / contacto 40499999 (queda intacto). " +
+        "Perdedor: lead 22630002 / contacto 40490002 -> se moveria a pipeline 14517971 status 112145359 " +
+        "y queda vinculado al contacto 40499999 como principal. " +
+        "Telefono 5491122334455, detectado via fallback a la API de Kommo. No se ejecuta (DRY_RUN=true)."
+    );
+    expect(fields).toMatchObject({
+      detectedVia: "fallback_kommo",
+      winnerLeadId: "22639999",
+      winnerContactId: "40499999",
+      loserLeadId: "22630002",
+      loserContactId: "40490002",
+    });
+  });
+
+  it("pending_review: dice por que y los ids de ambos lados, sin log de decision", async () => {
+    mocks.config.dryRun = true;
+    // Contacto indexado mas viejo, pero con un lead mas nuevo que el del evento.
+    mocks.findByPhone.mockReturnValue([{ ...OTHER_ROW, kommo_lead_id: "22639999" }]);
+
+    await processIncomingEntity(BASE_INPUT);
+
+    const [msg, fields] = findLog(mocks.loggerWarn, "duplicate_pending_review");
+    expect(msg).toBe(
+      "[DRY RUN] Revision manual (pending_review): los ids de contacto y de lead no coinciden en cual es mas nuevo, revisar a mano. " +
+        "Lado indexado: contacto 40490001 / lead(s) abierto(s) 22639999. " +
+        "Lado del evento: contacto 40490002 / lead(s) 22630002. " +
+        "Telefono 5491122334455, detectado via indice local. No se mueve nada."
+    );
+    expect(fields).toMatchObject({
+      reason: "los ids de contacto y de lead no coinciden en cual es mas nuevo, revisar a mano",
+      detectedVia: "indice_local",
+      indexedContactId: "40490001",
+      indexedLeadIds: ["22639999"],
+      incomingContactId: "40490002",
+      incomingLeadIds: ["22630002"],
+    });
+    expect(mocks.loggerInfo.mock.calls.some((c) => (c[1] as { event?: string })?.event === "duplicate_decision")).toBe(false);
+  });
+
+  it("pending_review por fallback a Kommo (varios leads abiertos): mismo formato", async () => {
+    mocks.findByPhone.mockResolvedValue([]);
+    mocks.findContactsByPhoneQuery.mockResolvedValue([
+      { id: "40490001", phones: ["+5491122334455"], leadIds: ["22630001"] },
+    ]);
+    mocks.getContactLeadIds.mockResolvedValue(["22630001", "22620000"]);
+
+    await processIncomingEntity(BASE_INPUT);
+
+    const [msg] = findLog(mocks.loggerWarn, "duplicate_pending_review");
+    expect(msg).toBe(
+      "Revision manual (pending_review): el contacto indexado tiene varios leads abiertos. " +
+        "Lado indexado: contacto 40490001 / lead(s) abierto(s) 22630001, 22620000. " +
+        "Lado del evento: contacto 40490002 / lead(s) 22630002. " +
+        "Telefono 5491122334455, detectado via fallback a la API de Kommo. No se mueve nada."
+    );
+  });
+
+  it("pending_review antes de consultar Kommo (evento sin lead): muestra el lead del indice", async () => {
+    mocks.findByPhone.mockReturnValue([OTHER_ROW]);
+
+    await processIncomingEntity({ ...BASE_INPUT, linkedLeadIds: [] });
+
+    const [msg] = findLog(mocks.loggerWarn, "duplicate_pending_review");
+    expect(msg).toBe(
+      "Revision manual (pending_review): el evento no trae lead del contacto (ej: unsorted). " +
+        "Lado indexado: contacto 40490001 / lead en indice 22630001. " +
+        "Lado del evento: contacto 40490002 / lead(s) -. " +
+        "Telefono 5491122334455, detectado via indice local. No se mueve nada."
     );
   });
 });

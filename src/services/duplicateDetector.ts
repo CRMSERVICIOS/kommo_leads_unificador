@@ -2,7 +2,12 @@ import { config } from "../config";
 import { logger } from "../logger";
 import { normalizePhone } from "./phoneNormalizer";
 import { findContactsByPhoneQuery, getContactLeadIds, getLead } from "./kommoClient";
-import { DUPLICATES_PIPELINE_ID, resolveWinner, unifyDuplicate } from "./duplicateUnifier";
+import {
+  DUPLICATES_PIPELINE_ID,
+  DUPLICATES_STATUS_ID,
+  resolveWinner,
+  unifyDuplicate,
+} from "./duplicateUnifier";
 import {
   belongsToDifferentEntity,
   findByPhone,
@@ -249,9 +254,11 @@ const MAX_INDEXED_LEADS_TO_CHECK = 10;
  * Resuelve automaticamente un duplicado recien registrado. Gana el lado con
  * ids de contacto y de lead MAS ALTOS (el mas reciente), venga del indice o
  * del evento; el perdedor se vincula al contacto ganador y va al embudo
- * Duplicados (ver unifyDuplicate). Deja la deteccion en pending_review (para
- * revision manual, sin reintentos) cuando:
- *  - DRY_RUN=true (freno de emergencia: solo loguea).
+ * Duplicados (ver unifyDuplicate). Siempre loguea la decision explicita
+ * ("Ganador: ... Perdedor: ...") o el motivo de la revision manual, con los
+ * ids de ambos lados. Deja la deteccion en pending_review (para revision
+ * manual, sin reintentos) cuando:
+ *  - DRY_RUN=true (freno de emergencia: decide y loguea, sin escribir).
  *  - el evento no trae exactamente UN lead del contacto (ej: eventos
  *    "unsorted", cuyo lead todavia no fue aceptado, o contactos con varios
  *    leads: no sabemos cual comparar).
@@ -271,33 +278,43 @@ async function autoUnify(
   const indexedContactId = indexed.kommo_contact_id;
   const incomingContactId = input.contactId;
   const incomingLeadIds = input.linkedLeadIds ?? [];
+  const dryRun = config.dryRun;
+  const prefix = dryRun ? "[DRY RUN] " : "";
+  const detectedVia = indexed.source === "kommo_lookup" ? "fallback_kommo" : "indice_local";
+  const detectedViaText = detectedVia === "fallback_kommo" ? "fallback a la API de Kommo" : "indice local";
 
-  const logContext = {
+  // Que se sabe del lead del lado indexado: el de phone_index hasta que se
+  // consultan sus leads abiertos en Kommo.
+  let indexedLeadsText = `lead en indice ${indexed.kommo_lead_id ?? "-"}`;
+  let indexedLeadIds: string[] = indexed.kommo_lead_id ? [indexed.kommo_lead_id] : [];
+
+  const baseFields = () => ({
+    dryRun,
+    detectedVia,
     phoneNormalized,
     indexedContactId,
+    indexedLeadIds,
     incomingContactId,
     incomingLeadIds,
-  };
+  });
 
-  if (config.dryRun) {
-    logger.info(
-      `[DRY RUN] Duplicado detectado: telefono ${phoneNormalized} coincide con el contacto indexado ${indexedContactId}. ` +
-        `Se resolveria contra el contacto ${incomingContactId} (leads ${incomingLeadIds.join(", ") || "-"}), pero no se ejecuta (DRY_RUN=true).`,
-      logContext
+  /** Log explicito de por que queda en revision manual, con los ids de ambos lados. */
+  const pending = (reason: string, level: "warn" | "error" = "warn", extra: Record<string, unknown> = {}): string => {
+    logger[level](
+      `${prefix}Revision manual (pending_review): ${reason}. ` +
+        `Lado indexado: contacto ${indexedContactId ?? "-"} / ${indexedLeadsText}. ` +
+        `Lado del evento: contacto ${incomingContactId ?? "-"} / lead(s) ${incomingLeadIds.join(", ") || "-"}. ` +
+        `Telefono ${phoneNormalized}, detectado via ${detectedViaText}. No se mueve nada.`,
+      { event: "duplicate_pending_review", reason, ...baseFields(), ...extra }
     );
-    return "DRY_RUN=true";
-  }
-
-  const skip = (reason: string): string => {
-    logger.warn("auto_unify_skipped_pending_review", { ...logContext, reason });
     return reason;
   };
 
   if (!indexedContactId || !incomingContactId) {
-    return skip("falta el contacto indexado o el del evento");
+    return pending("falta el contacto indexado o el del evento");
   }
   if (incomingLeadIds.length !== 1) {
-    return skip(
+    return pending(
       incomingLeadIds.length === 0
         ? "el evento no trae lead del contacto (ej: unsorted)"
         : "el contacto del evento tiene varios leads vinculados"
@@ -306,12 +323,16 @@ async function autoUnify(
   const incoming = { contactId: incomingContactId, leadId: incomingLeadIds[0] };
 
   try {
+    // Solo lecturas a Kommo: corren tambien con DRY_RUN=true para poder
+    // loguear la decision real.
     const indexedOpenLeads = await findOpenLeadsOf(indexed, incomingLeadIds);
     if (indexedOpenLeads === null) {
-      return skip("el contacto indexado tiene demasiados leads, revisar a mano");
+      return pending("el contacto indexado tiene demasiados leads, revisar a mano");
     }
+    indexedLeadIds = indexedOpenLeads;
+    indexedLeadsText = `lead(s) abierto(s) ${indexedOpenLeads.join(", ") || "ninguno"}`;
     if (indexedOpenLeads.length !== 1) {
-      return skip(
+      return pending(
         indexedOpenLeads.length === 0
           ? "el contacto indexado no tiene leads abiertos"
           : "el contacto indexado tiene varios leads abiertos"
@@ -320,34 +341,57 @@ async function autoUnify(
 
     const pair = resolveWinner(incoming, { contactId: indexedContactId, leadId: indexedOpenLeads[0] });
     if (!pair) {
-      return skip("los ids de contacto y de lead no coinciden en cual es mas nuevo, revisar a mano");
+      return pending("los ids de contacto y de lead no coinciden en cual es mas nuevo, revisar a mano");
     }
     // El lead indexado ya se filtro por abierto; el del evento se verifica
     // solo si es el que se va a mover.
     if (pair.loser === incoming && !isOpenLead(await getLead(incoming.leadId))) {
-      return skip("el lead perdedor ya esta cerrado o en Duplicados");
+      return pending("el lead perdedor ya esta cerrado o en Duplicados");
     }
 
+    const { winner, loser } = pair;
+    logger.info(
+      `${prefix}Ganador: lead ${winner.leadId} / contacto ${winner.contactId} (queda intacto). ` +
+        `Perdedor: lead ${loser.leadId} / contacto ${loser.contactId} -> ` +
+        `${dryRun ? "se moveria" : "se mueve"} a pipeline ${DUPLICATES_PIPELINE_ID} status ${DUPLICATES_STATUS_ID} ` +
+        `y queda vinculado al contacto ${winner.contactId} como principal. ` +
+        `Telefono ${phoneNormalized}, detectado via ${detectedViaText}. ` +
+        (dryRun ? "No se ejecuta (DRY_RUN=true)." : "Se ejecuta."),
+      {
+        event: "duplicate_decision",
+        dryRun,
+        detectedVia,
+        phoneNormalized,
+        winnerLeadId: winner.leadId,
+        winnerContactId: winner.contactId,
+        loserLeadId: loser.leadId,
+        loserContactId: loser.contactId,
+        targetPipelineId: DUPLICATES_PIPELINE_ID,
+        targetStatusId: DUPLICATES_STATUS_ID,
+      }
+    );
+
+    if (dryRun) return "DRY_RUN=true";
+
     const result = await unifyDuplicate({
-      winnerContactId: pair.winner.contactId,
-      winnerLeadId: pair.winner.leadId,
-      loserContactId: pair.loser.contactId,
-      loserLeadId: pair.loser.leadId,
+      winnerContactId: winner.contactId,
+      winnerLeadId: winner.leadId,
+      loserContactId: loser.contactId,
+      loserLeadId: loser.leadId,
     });
 
     if (!result.ok) {
       const failed = result.steps.find((s) => s.status === "failed");
-      logger.error("auto_unify_failed_pending_review", {
-        ...logContext,
-        steps: result.steps.map((s) => ({ step: s.step, status: s.status, error: s.error })),
-      });
-      return `fallo la fusion en el paso ${failed?.step ?? "?"}: ${failed?.error ?? "sin detalle"}`;
+      return pending(
+        `fallo la fusion en el paso ${failed?.step ?? "?"}: ${failed?.error ?? "sin detalle"}`,
+        "error",
+        { steps: result.steps.map((s) => ({ step: s.step, status: s.status, error: s.error })) }
+      );
     }
     return null;
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    logger.error("auto_unify_failed_pending_review", { ...logContext, error });
-    return `fallo la fusion: ${error}`;
+    return pending(`fallo la fusion: ${error}`, "error");
   }
 }
 

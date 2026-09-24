@@ -45,6 +45,7 @@ vi.mock("../src/services/duplicateUnifier", async () => {
   );
   return {
     DUPLICATES_PIPELINE_ID: actual.DUPLICATES_PIPELINE_ID,
+    DUPLICATES_STATUS_ID: actual.DUPLICATES_STATUS_ID,
     resolveWinner: actual.resolveWinner,
     unifyDuplicate: mocks.unifyDuplicate,
   };
