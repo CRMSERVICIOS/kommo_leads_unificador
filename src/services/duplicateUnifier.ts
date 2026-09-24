@@ -14,6 +14,14 @@ export const DUPLICATES_PIPELINE_ID = 14517971;
  */
 export const DUPLICATES_STATUS_ID = 112145359;
 
+/**
+ * Responsable al que se reasigna el lead perdedor: Martin Vassallo, el
+ * usuario de la integracion (verificado con GET /users/12280712,
+ * 2026-09-24). Asi los leads de Duplicados no quedan en la lista de trabajo
+ * de un vendedor.
+ */
+export const DUPLICATES_RESPONSIBLE_USER_ID = 12280712;
+
 /** Un lado del duplicado: un contacto y el lead suyo que se compara. */
 export interface DuplicateSide {
   contactId: string;
@@ -86,7 +94,8 @@ export interface UnifyDuplicateResult {
  *     original NO se desvincula: queda como secundario, asi la conversacion
  *     de WhatsApp vieja sigue accesible.
  *  2. Lo mueve al embudo Duplicados (DUPLICATES_PIPELINE_ID /
- *     DUPLICATES_STATUS_ID).
+ *     DUPLICATES_STATUS_ID) y lo reasigna a DUPLICATES_RESPONSIBLE_USER_ID,
+ *     en el mismo PATCH.
  *
  * Si falla la vinculacion no se mueve el lead: quedaria en Duplicados sin
  * colgar del contacto ganador.
@@ -133,10 +142,20 @@ export async function unifyDuplicate(
       {
         method: "PATCH",
         path: `/leads/${input.loserLeadId}`,
-        body: { pipeline_id: DUPLICATES_PIPELINE_ID, status_id: DUPLICATES_STATUS_ID },
+        body: {
+          pipeline_id: DUPLICATES_PIPELINE_ID,
+          status_id: DUPLICATES_STATUS_ID,
+          responsible_user_id: DUPLICATES_RESPONSIBLE_USER_ID,
+        },
       },
       dryRun,
-      () => moveLeadToStage(input.loserLeadId, DUPLICATES_PIPELINE_ID, DUPLICATES_STATUS_ID)
+      () =>
+        moveLeadToStage(
+          input.loserLeadId,
+          DUPLICATES_PIPELINE_ID,
+          DUPLICATES_STATUS_ID,
+          DUPLICATES_RESPONSIBLE_USER_ID
+        )
     )
   );
 

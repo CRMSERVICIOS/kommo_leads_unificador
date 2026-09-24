@@ -17,6 +17,7 @@ vi.mock("../src/db/duplicateDetections", () => ({
 
 import {
   DUPLICATES_PIPELINE_ID,
+  DUPLICATES_RESPONSIBLE_USER_ID,
   DUPLICATES_STATUS_ID,
   resolveWinner,
   unifyDuplicate,
@@ -72,17 +73,18 @@ describe("unifyDuplicate", () => {
     expect(mocks.linkContactToLead).toHaveBeenCalledWith("22627454", "40487830", { isMain: true });
   });
 
-  it("mueve el lead perdedor al embudo Duplicados, sin tocar ningun otro campo", async () => {
+  it("mueve el lead perdedor a Duplicados y lo reasigna a Martin Vassallo, en un solo PATCH", async () => {
     const result = await unifyDuplicate(INPUT);
 
     expect(DUPLICATES_PIPELINE_ID).toBe(14517971);
     expect(DUPLICATES_STATUS_ID).toBe(112145359);
+    expect(DUPLICATES_RESPONSIBLE_USER_ID).toBe(12280712);
     expect(mocks.moveLeadToStage).toHaveBeenCalledTimes(1);
-    expect(mocks.moveLeadToStage).toHaveBeenCalledWith("22627454", 14517971, 112145359);
+    expect(mocks.moveLeadToStage).toHaveBeenCalledWith("22627454", 14517971, 112145359, 12280712);
     expect(result.steps.at(-1)).toMatchObject({
       step: "move_loser_lead_to_duplicates",
       status: "ok",
-      request: { method: "PATCH", path: "/leads/22627454", body: { pipeline_id: 14517971, status_id: 112145359 } },
+      request: { method: "PATCH", path: "/leads/22627454", body: { pipeline_id: 14517971, status_id: 112145359, responsible_user_id: 12280712 } },
     });
   });
 
@@ -147,7 +149,7 @@ describe("unifyDuplicate", () => {
         path: "/leads/22627454/link",
         body: [{ to_entity_id: 40487830, to_entity_type: "contacts", metadata: { is_main: true } }],
       },
-      { method: "PATCH", path: "/leads/22627454", body: { pipeline_id: 14517971, status_id: 112145359 } },
+      { method: "PATCH", path: "/leads/22627454", body: { pipeline_id: 14517971, status_id: 112145359, responsible_user_id: 12280712 } },
     ]);
     expect(result.steps.map((s) => s.status)).toEqual(["dry_run", "dry_run"]);
   });

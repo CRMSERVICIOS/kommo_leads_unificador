@@ -140,19 +140,24 @@ export async function getLead(leadId: string): Promise<KommoLeadSummary> {
 }
 
 /**
- * Mueve un lead a una etapa (y embudo) y devuelve la respuesta cruda de
- * Kommo. Relanza si Kommo responde error. Solo manda `pipeline_id` +
- * `status_id`: ningun otro campo del lead se toca.
- *   PATCH /api/v4/leads/{id}  { "pipeline_id": 123, "status_id": 456 }
+ * Mueve un lead a una etapa (y embudo) y le cambia el responsable, en una
+ * sola llamada. Devuelve la respuesta cruda de Kommo; relanza si Kommo
+ * responde error. Ningun otro campo del lead se toca.
+ *   PATCH /api/v4/leads/{id}  { "pipeline_id": 123, "status_id": 456, "responsible_user_id": 789 }
  */
 export async function moveLeadToStage(
   leadId: string,
   pipelineId: number,
-  statusId: number
+  statusId: number,
+  responsibleUserId: number
 ): Promise<unknown> {
   return kommoFetch(`/leads/${leadId}`, {
     method: "PATCH",
-    body: JSON.stringify({ pipeline_id: pipelineId, status_id: statusId }),
+    body: JSON.stringify({
+      pipeline_id: pipelineId,
+      status_id: statusId,
+      responsible_user_id: responsibleUserId,
+    }),
   });
 }
 

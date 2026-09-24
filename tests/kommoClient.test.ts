@@ -37,13 +37,13 @@ describe("kommoClient - shapes de request", () => {
     });
   });
 
-  it("moveLeadToStage: PATCH /leads/{id} solo con pipeline_id + status_id", async () => {
-    await moveLeadToStage("22627454", 14517971, 112145359);
+  it("moveLeadToStage: PATCH /leads/{id} con pipeline_id + status_id + responsible_user_id", async () => {
+    await moveLeadToStage("22627454", 14517971, 112145359, 12280712);
 
     expect(lastRequest()).toEqual({
       url: "https://rudas.kommo.com/api/v4/leads/22627454",
       method: "PATCH",
-      body: { pipeline_id: 14517971, status_id: 112145359 },
+      body: { pipeline_id: 14517971, status_id: 112145359, responsible_user_id: 12280712 },
     });
   });
 

@@ -62,6 +62,7 @@ vi.mock("../src/services/duplicateUnifier", async () => {
     // resolveWinner es la regla de quien gana: se prueba la real.
     DUPLICATES_PIPELINE_ID: actual.DUPLICATES_PIPELINE_ID,
     DUPLICATES_STATUS_ID: actual.DUPLICATES_STATUS_ID,
+    DUPLICATES_RESPONSIBLE_USER_ID: actual.DUPLICATES_RESPONSIBLE_USER_ID,
     resolveWinner: actual.resolveWinner,
     unifyDuplicate: mocks.unifyDuplicate,
   };
@@ -498,6 +499,7 @@ describe("log explicito de la decision ganador/perdedor", () => {
     expect(msg).toBe(
       "[DRY RUN] Ganador: lead 22630002 / contacto 40490002 (queda intacto). " +
         "Perdedor: lead 22630001 / contacto 40490001 -> se moveria a pipeline 14517971 status 112145359 " +
+        "con responsible_user_id 12280712 " +
         "y queda vinculado al contacto 40490002 como principal. " +
         "Telefono 5491122334455, detectado via indice local. No se ejecuta (DRY_RUN=true)."
     );
@@ -510,6 +512,7 @@ describe("log explicito de la decision ganador/perdedor", () => {
       loserContactId: "40490001",
       targetPipelineId: 14517971,
       targetStatusId: 112145359,
+      targetResponsibleUserId: 12280712,
     });
     expect(mocks.unifyDuplicate).not.toHaveBeenCalled();
   });
@@ -523,6 +526,7 @@ describe("log explicito de la decision ganador/perdedor", () => {
     expect(msg).toBe(
       "Ganador: lead 22630002 / contacto 40490002 (queda intacto). " +
         "Perdedor: lead 22630001 / contacto 40490001 -> se mueve a pipeline 14517971 status 112145359 " +
+        "con responsible_user_id 12280712 " +
         "y queda vinculado al contacto 40490002 como principal. " +
         "Telefono 5491122334455, detectado via indice local. Se ejecuta."
     );
@@ -547,6 +551,7 @@ describe("log explicito de la decision ganador/perdedor", () => {
     expect(msg).toBe(
       "[DRY RUN] Ganador: lead 22639999 / contacto 40499999 (queda intacto). " +
         "Perdedor: lead 22630002 / contacto 40490002 -> se moveria a pipeline 14517971 status 112145359 " +
+        "con responsible_user_id 12280712 " +
         "y queda vinculado al contacto 40499999 como principal. " +
         "Telefono 5491122334455, detectado via fallback a la API de Kommo. No se ejecuta (DRY_RUN=true)."
     );

@@ -35,6 +35,8 @@ const state = vi.hoisted(() => ({
   kommoContactLeads: new Map<string, Set<string>>(),
   /** lead -> embudo/etapa, como lo ve Kommo. */
   leadStage: new Map<string, { pipeline_id: number; status_id: number }>(),
+  /** lead -> responsible_user_id asignado por la fusion. */
+  leadResponsible: new Map<string, number>(),
   /** Cada escritura que recibio Kommo: [endpoint, lead]. */
   writes: [] as [string, string][],
 }));
@@ -133,9 +135,10 @@ vi.mock("../src/services/kommoClient", () => {
       id: Number(leadId),
       ...(state.leadStage.get(leadId) ?? { pipeline_id: 14491207, status_id: 111934987 }),
     }),
-    moveLeadToStage: async (leadId: string, pipelineId: number, statusId: number) => {
+    moveLeadToStage: async (leadId: string, pipelineId: number, statusId: number, responsibleUserId: number) => {
       state.writes.push(["move", leadId]);
       state.leadStage.set(leadId, { pipeline_id: pipelineId, status_id: statusId });
+      state.leadResponsible.set(leadId, responsibleUserId);
       return {};
     },
   };
@@ -177,6 +180,7 @@ beforeEach(() => {
   state.seenEvents = new Set();
   state.kommoContactLeads = new Map();
   state.leadStage = new Map();
+  state.leadResponsible = new Map();
   state.writes = [];
 });
 
@@ -197,6 +201,9 @@ describe("eco de fusion", () => {
     // ...sin perder su contacto original (secundario), y en el embudo Duplicados.
     expect(state.kommoContactLeads.get(OLDER.contactId)).toEqual(new Set([OLDER.leadId]));
     expect(state.leadStage.get(OLDER.leadId)).toEqual(IN_DUPLICATES);
+    // ...reasignado a Martin Vassallo (usuario de la integracion).
+    expect(state.leadResponsible.get(OLDER.leadId)).toBe(12280712);
+    expect(state.leadResponsible.has(NEWER.leadId)).toBe(false);
 
     const writesBeforeEcho = state.writes.length;
 

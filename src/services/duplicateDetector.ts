@@ -4,6 +4,7 @@ import { normalizePhone } from "./phoneNormalizer";
 import { findContactsByPhoneQuery, getContactLeadIds, getLead } from "./kommoClient";
 import {
   DUPLICATES_PIPELINE_ID,
+  DUPLICATES_RESPONSIBLE_USER_ID,
   DUPLICATES_STATUS_ID,
   resolveWinner,
   unifyDuplicate,
@@ -354,6 +355,7 @@ async function autoUnify(
       `${prefix}Ganador: lead ${winner.leadId} / contacto ${winner.contactId} (queda intacto). ` +
         `Perdedor: lead ${loser.leadId} / contacto ${loser.contactId} -> ` +
         `${dryRun ? "se moveria" : "se mueve"} a pipeline ${DUPLICATES_PIPELINE_ID} status ${DUPLICATES_STATUS_ID} ` +
+        `con responsible_user_id ${DUPLICATES_RESPONSIBLE_USER_ID} ` +
         `y queda vinculado al contacto ${winner.contactId} como principal. ` +
         `Telefono ${phoneNormalized}, detectado via ${detectedViaText}. ` +
         (dryRun ? "No se ejecuta (DRY_RUN=true)." : "Se ejecuta."),
@@ -368,6 +370,7 @@ async function autoUnify(
         loserContactId: loser.contactId,
         targetPipelineId: DUPLICATES_PIPELINE_ID,
         targetStatusId: DUPLICATES_STATUS_ID,
+        targetResponsibleUserId: DUPLICATES_RESPONSIBLE_USER_ID,
       }
     );
 
