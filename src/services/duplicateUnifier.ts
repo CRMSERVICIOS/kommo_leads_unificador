@@ -1,49 +1,66 @@
 import { markDetectionsMergedForContacts } from "../db/duplicateDetections";
 import { logger } from "../logger";
-import {
-  addTagsToEntity,
-  createNote,
-  getLead,
-  linkContactToLead,
-  updateLeadStatus,
-} from "./kommoClient";
+import { linkContactToLead, moveLeadToStage } from "./kommoClient";
 
-export const MERGED_TAG_NAME = "duplicado-fusionado";
+/** Embudo "Duplicados" de la cuenta rudas, a donde va el lead perdedor. */
+export const DUPLICATES_PIPELINE_ID = 14517971;
 
 /**
- * Etapa de sistema "Cerrado - perdido". Confirmado en la doc de Kommo ("Each
- * Pipeline has 3 system Stage: ... Closed – Lost (ID = 143)") y contra la
- * cuenta rudas: los 16 embudos la tienen, no editable.
+ * Etapa del embudo Duplicados donde cae el lead perdedor: "Contacto inicial".
+ * Leido con GET /leads/pipelines/14517971 (2026-09-24). La primera etapa del
+ * embudo es "Leads Entrantes" (112145355), pero es type 1: la etapa de
+ * entrantes/unsorted, a la que no se puede mover un lead existente. Esta es
+ * la primera etapa comun (type 0, sort 20).
  */
-export const CLOSED_LOST_STATUS_ID = 143;
+export const DUPLICATES_STATUS_ID = 112145359;
 
-/** Etapa de sistema "Cerrado - ganado" (misma fuente que la de arriba). */
-export const CLOSED_WON_STATUS_ID = 142;
+/** Un lado del duplicado: un contacto y el lead suyo que se compara. */
+export interface DuplicateSide {
+  contactId: string;
+  leadId: string;
+}
+
+export interface WinnerLoser {
+  winner: DuplicateSide;
+  loser: DuplicateSide;
+}
+
+const NUMERIC_ID = /^\d+$/;
+
+/**
+ * Regla de quien gana: el lado con ids MAS ALTOS (en Kommo los ids son
+ * secuenciales, el mas alto es el mas reciente). Devuelve null si no se
+ * puede decidir sin ambiguedad: ids no numericos, iguales, o el contacto y
+ * el lead de un mismo lado no coinciden en cual es mas nuevo.
+ */
+export function resolveWinner(a: DuplicateSide, b: DuplicateSide): WinnerLoser | null {
+  const ids = [a.contactId, a.leadId, b.contactId, b.leadId];
+  if (!ids.every((id) => NUMERIC_ID.test(id))) return null;
+
+  const contactCmp = Math.sign(Number(a.contactId) - Number(b.contactId));
+  const leadCmp = Math.sign(Number(a.leadId) - Number(b.leadId));
+  if (contactCmp === 0 || contactCmp !== leadCmp) return null;
+
+  return contactCmp > 0 ? { winner: a, loser: b } : { winner: b, loser: a };
+}
 
 export interface UnifyDuplicateInput {
-  /** Contacto ganador: el que ya estaba en phone_index antes. */
-  existingContactId: string;
-  /** Lead del contacto ganador, si se conoce (recibe una nota informativa). */
-  existingLeadId: string | null;
-  /** Contacto perdedor. NO se borra, archiva ni desvincula en esta version. */
-  newContactId: string;
-  /** Lead nuevo (perdedor): se vincula al contacto ganador, se marca y se cierra como perdido. */
-  newLeadId: string;
+  /** Contacto ganador (ids mas altos). No se toca. */
+  winnerContactId: string;
+  /** Lead ganador. No se toca; solo va a los logs. */
+  winnerLeadId: string | null;
+  /** Contacto perdedor. No se toca ni se desvincula: queda como secundario del lead perdedor. */
+  loserContactId: string;
+  /** Lead perdedor: se vincula al contacto ganador y se mueve al embudo Duplicados. */
+  loserLeadId: string;
 }
 
 export interface UnifyDuplicateOptions {
   /** Si es true, loguea que haria cada paso pero no llama a Kommo. */
   dryRun?: boolean;
-  /** Motivo de perdida para el cierre del lead nuevo (ej: "Dato duplicado"). */
-  lossReasonId?: number | null;
 }
 
-export type UnifyStepName =
-  | "link_new_lead_to_existing_contact"
-  | "note_on_new_lead"
-  | "tag_new_lead"
-  | "note_on_existing_lead"
-  | "close_new_lead";
+export type UnifyStepName = "link_loser_lead_to_winner_contact" | "move_loser_lead_to_duplicates";
 
 export interface UnifyStepResult {
   step: UnifyStepName;
@@ -62,40 +79,17 @@ export interface UnifyDuplicateResult {
   detectionsMarkedMerged: number;
 }
 
-export function buildNewLeadNote(input: UnifyDuplicateInput): string {
-  return (
-    `[DUPLICADO] Posible duplicado vinculado automáticamente con el contacto #${input.existingContactId} ` +
-    `(mismo teléfono). Verificar.`
-  );
-}
-
-export function buildExistingLeadNote(input: UnifyDuplicateInput): string {
-  return (
-    `[DUPLICADO] Se vinculó a este contacto (#${input.existingContactId}) el lead #${input.newLeadId}, ` +
-    `que era un duplicado por mismo teléfono (venía del contacto #${input.newContactId}). Verificar.`
-  );
-}
-
 /**
- * Fusion (Fase 2, primera version, disparo manual): el ganador es siempre el
- * contacto/lead EXISTENTE.
+ * Resuelve un duplicado. El lead/contacto ganador queda exactamente como
+ * esta. Sobre el lead perdedor:
+ *  1. Vincula el contacto ganador como contacto principal. Su contacto
+ *     original NO se desvincula: queda como secundario, asi la conversacion
+ *     de WhatsApp vieja sigue accesible.
+ *  2. Lo mueve al embudo Duplicados (DUPLICATES_PIPELINE_ID /
+ *     DUPLICATES_STATUS_ID).
  *
- * Pasos:
- *  1. Vincula el lead nuevo al contacto ganador, como contacto principal.
- *  2. Nota + tag "duplicado-fusionado" en el lead nuevo.
- *  3. Nota en el lead ganador (si se conoce).
- *  4. Cierra el lead nuevo como perdido (etapa 143), en su mismo embudo, con
- *     el motivo de perdida `lossReasonId` si se pasa.
- *
- * A proposito NO hace: borrar o archivar el contacto perdedor, ni
- * desvincular el contacto perdedor del lead nuevo (la conversacion de
- * WhatsApp vive en ese contacto; se mantiene vinculado hasta confirmar que no
- * se pierde nada).
- *
- * Si falla la vinculacion (paso 1) no se marca nada: una nota diciendo
- * "vinculado" seria falsa. Los pasos 2 y 3 son independientes entre si. El
- * cierre (paso 4) solo corre si todos los anteriores salieron bien: no se
- * cierra un lead sin la nota/tag que explican por que.
+ * Si falla la vinculacion no se mueve el lead: quedaria en Duplicados sin
+ * colgar del contacto ganador.
  */
 export async function unifyDuplicate(
   input: UnifyDuplicateInput,
@@ -107,130 +101,46 @@ export async function unifyDuplicate(
   logger.info("unify_duplicate_started", { ...input, dryRun });
 
   const linkStep = await runStep(
-    "link_new_lead_to_existing_contact",
+    "link_loser_lead_to_winner_contact",
     {
       method: "POST",
-      path: `/leads/${input.newLeadId}/link`,
+      path: `/leads/${input.loserLeadId}/link`,
       body: [
         {
-          to_entity_id: Number(input.existingContactId),
+          to_entity_id: Number(input.winnerContactId),
           to_entity_type: "contacts",
           metadata: { is_main: true },
         },
       ],
     },
     dryRun,
-    () => linkContactToLead(input.newLeadId, input.existingContactId, { isMain: true })
+    () => linkContactToLead(input.loserLeadId, input.winnerContactId, { isMain: true })
   );
   steps.push(linkStep);
 
   if (linkStep.status === "failed") {
-    for (const step of ["note_on_new_lead", "tag_new_lead", "note_on_existing_lead", "close_new_lead"] as const) {
-      steps.push({ step, status: "skipped", reason: "fallo la vinculacion del lead nuevo" });
-    }
+    steps.push({
+      step: "move_loser_lead_to_duplicates",
+      status: "skipped",
+      reason: "fallo la vinculacion del lead perdedor",
+    });
     return finish(input, dryRun, steps);
   }
 
-  const newLeadNote = buildNewLeadNote(input);
   steps.push(
     await runStep(
-      "note_on_new_lead",
-      {
-        method: "POST",
-        path: "/leads/notes",
-        body: [{ entity_id: Number(input.newLeadId), note_type: "common", params: { text: newLeadNote } }],
-      },
-      dryRun,
-      () => createNote("leads", input.newLeadId, newLeadNote)
-    )
-  );
-
-  steps.push(
-    await runStep(
-      "tag_new_lead",
+      "move_loser_lead_to_duplicates",
       {
         method: "PATCH",
-        path: `/leads/${input.newLeadId}`,
-        body: { tags_to_add: [{ name: MERGED_TAG_NAME }] },
+        path: `/leads/${input.loserLeadId}`,
+        body: { pipeline_id: DUPLICATES_PIPELINE_ID, status_id: DUPLICATES_STATUS_ID },
       },
       dryRun,
-      () => addTagsToEntity("leads", input.newLeadId, [MERGED_TAG_NAME])
+      () => moveLeadToStage(input.loserLeadId, DUPLICATES_PIPELINE_ID, DUPLICATES_STATUS_ID)
     )
   );
 
-  if (input.existingLeadId) {
-    const existingLeadId = input.existingLeadId;
-    const existingLeadNote = buildExistingLeadNote(input);
-    steps.push(
-      await runStep(
-        "note_on_existing_lead",
-        {
-          method: "POST",
-          path: "/leads/notes",
-          body: [{ entity_id: Number(existingLeadId), note_type: "common", params: { text: existingLeadNote } }],
-        },
-        dryRun,
-        () => createNote("leads", existingLeadId, existingLeadNote)
-      )
-    );
-  } else {
-    const skipped: UnifyStepResult = {
-      step: "note_on_existing_lead",
-      status: "skipped",
-      reason: "existingLeadId no informado",
-    };
-    logger.info("unify_step_skipped", { step: skipped.step, reason: skipped.reason });
-    steps.push(skipped);
-  }
-
-  if (steps.some((s) => s.status === "failed")) {
-    steps.push({ step: "close_new_lead", status: "skipped", reason: "fallo un paso anterior" });
-    return finish(input, dryRun, steps);
-  }
-
-  steps.push(await closeNewLead(input.newLeadId, options.lossReasonId ?? null, dryRun));
-
   return finish(input, dryRun, steps);
-}
-
-/**
- * Lee el lead para saber su embudo actual (lectura, corre tambien en dryRun
- * para que la vista previa muestre el request real) y lo mueve a 143.
- */
-async function closeNewLead(
-  newLeadId: string,
-  lossReasonId: number | null,
-  dryRun: boolean
-): Promise<UnifyStepResult> {
-  let pipelineId: number;
-  try {
-    const lead = await getLead(newLeadId);
-    pipelineId = lead.pipeline_id;
-    logger.info("unify_close_lead_current_state", {
-      leadId: newLeadId,
-      pipelineId: lead.pipeline_id,
-      statusId: lead.status_id,
-    });
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    logger.error("unify_step_failed", { step: "close_new_lead", error, phase: "get_lead" });
-    return { step: "close_new_lead", status: "failed", error };
-  }
-
-  return runStep(
-    "close_new_lead",
-    {
-      method: "PATCH",
-      path: `/leads/${newLeadId}`,
-      body: {
-        pipeline_id: pipelineId,
-        status_id: CLOSED_LOST_STATUS_ID,
-        ...(lossReasonId ? { loss_reason_id: lossReasonId } : {}),
-      },
-    },
-    dryRun,
-    () => updateLeadStatus(newLeadId, pipelineId, CLOSED_LOST_STATUS_ID, lossReasonId)
-  );
 }
 
 async function runStep(
@@ -267,8 +177,8 @@ async function finish(
   let detectionsMarkedMerged = 0;
   if (ok && !dryRun) {
     detectionsMarkedMerged = await markDetectionsMergedForContacts(
-      input.existingContactId,
-      input.newContactId
+      input.winnerContactId,
+      input.loserContactId
     );
   }
 

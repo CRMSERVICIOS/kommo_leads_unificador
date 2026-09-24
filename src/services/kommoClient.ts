@@ -140,84 +140,19 @@ export async function getLead(leadId: string): Promise<KommoLeadSummary> {
 }
 
 /**
- * Mueve un lead a una etapa y devuelve la respuesta cruda de Kommo. Relanza
- * si Kommo responde error.
- *
- * Se manda SIEMPRE `pipeline_id` junto con `status_id`: las etapas de
- * sistema 142 (ganado) y 143 (perdido) existen con el mismo id en todos los
- * embudos, y la receta de la doc ("Move a lead to another stage") manda los
- * dos. Pasando el embudo actual del lead, el lead no cambia de embudo.
- *   PATCH /api/v4/leads/{id}  { "pipeline_id": 123, "status_id": 143, "loss_reason_id": 456 }
- * `loss_reason_id` es opcional ("Lead loss reason ID" en la doc); los motivos
- * se crean desde la UI de Kommo (la API v4 solo permite listarlos).
+ * Mueve un lead a una etapa (y embudo) y devuelve la respuesta cruda de
+ * Kommo. Relanza si Kommo responde error. Solo manda `pipeline_id` +
+ * `status_id`: ningun otro campo del lead se toca.
+ *   PATCH /api/v4/leads/{id}  { "pipeline_id": 123, "status_id": 456 }
  */
-export async function updateLeadStatus(
+export async function moveLeadToStage(
   leadId: string,
   pipelineId: number,
-  statusId: number,
-  lossReasonId?: number | null
+  statusId: number
 ): Promise<unknown> {
   return kommoFetch(`/leads/${leadId}`, {
     method: "PATCH",
-    body: JSON.stringify({
-      pipeline_id: pipelineId,
-      status_id: statusId,
-      ...(lossReasonId ? { loss_reason_id: lossReasonId } : {}),
-    }),
-  });
-}
-
-export type KommoEntityType = "leads" | "contacts";
-
-/**
- * Crea una nota de texto ("common") en un lead o contacto y devuelve la
- * respuesta cruda de Kommo. Relanza si Kommo responde error.
- *
- * Confirmado contra la doc v4 (developers.kommo.com/reference/add-notes):
- *   POST /api/v4/{leads|contacts}/notes
- *   [{ "entity_id": 123, "note_type": "common", "params": { "text": "..." } }]
- */
-export async function createNote(
-  entityType: KommoEntityType,
-  entityId: string,
-  text: string
-): Promise<unknown> {
-  const body = [
-    {
-      entity_id: Number(entityId),
-      note_type: "common",
-      params: { text },
-    },
-  ];
-
-  return kommoFetch(`/${entityType}/notes`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-/**
- * Agrega tags a un lead o contacto SIN tocar los que ya tiene, y devuelve
- * la respuesta cruda de Kommo. Relanza si Kommo responde error.
- *
- * Confirmado contra la doc v4 (developers.kommo.com/reference/updating-single-lead):
- * `_embedded.tags` REEMPLAZA la lista completa de tags ("If already attached
- * tags are not passed, they will be detached"); `tags_to_add` solo agrega.
- *   PATCH /api/v4/leads/{id}
- *   { "tags_to_add": [{ "name": "duplicado-potencial" }] }
- */
-export async function addTagsToEntity(
-  entityType: KommoEntityType,
-  entityId: string,
-  tagNames: string[]
-): Promise<unknown> {
-  const body = {
-    tags_to_add: tagNames.map((name) => ({ name })),
-  };
-
-  return kommoFetch(`/${entityType}/${entityId}`, {
-    method: "PATCH",
-    body: JSON.stringify(body),
+    body: JSON.stringify({ pipeline_id: pipelineId, status_id: statusId }),
   });
 }
 
@@ -250,51 +185,4 @@ export async function linkContactToLead(
     method: "POST",
     body: JSON.stringify(body),
   });
-}
-
-/**
- * Agrega una nota de texto simple a un lead o contacto (best-effort: loguea
- * y no relanza si falla).
- */
-export async function addNote(
-  entityType: KommoEntityType,
-  entityId: string,
-  text: string
-): Promise<void> {
-  try {
-    await createNote(entityType, entityId, text);
-    logger.info("kommo_note_added", { entityType, entityId });
-  } catch (err) {
-    logger.error("kommo_add_note_failed", {
-      entityType,
-      entityId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    // No relanzamos: un fallo al notificar en Kommo no deberia frenar el
-    // resto del flujo de deteccion (el registro en duplicate_detections y
-    // la notificacion a Slack son la fuente de verdad para el humano).
-  }
-}
-
-/**
- * Agrega un tag a un lead o contacto sin pisar los existentes (best-effort:
- * loguea y no relanza si falla).
- */
-export async function addTag(
-  entityType: KommoEntityType,
-  entityId: string,
-  tagName: string
-): Promise<void> {
-  try {
-    await addTagsToEntity(entityType, entityId, [tagName]);
-    logger.info("kommo_tag_added", { entityType, entityId, tagName });
-  } catch (err) {
-    logger.error("kommo_add_tag_failed", {
-      entityType,
-      entityId,
-      tagName,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    // Idem addNote: no relanzamos, es un best-effort secundario.
-  }
 }

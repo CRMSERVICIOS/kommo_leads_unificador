@@ -13,13 +13,10 @@ export const config = {
   databaseCaCert: process.env.DATABASE_CA_CERT || "",
   port: Number(process.env.PORT || 3000),
   defaultCountryCode: process.env.DEFAULT_COUNTRY_CODE || "54",
-  // Freno de emergencia. Default false (produccion): los duplicados se
-  // fusionan automaticamente. Con DRY_RUN=true el detector solo loguea lo que
-  // haria, sin escribir nada en Kommo.
+  // Freno de emergencia. Default false: los duplicados se resuelven
+  // automaticamente (el lead perdedor va al embudo Duplicados). Con
+  // DRY_RUN=true el detector solo loguea lo que haria, sin escribir en Kommo.
   dryRun: process.env.DRY_RUN === "true",
-  // Motivo de perdida con el que se cierra el lead duplicado (GET
-  // /api/v4/leads/loss_reasons para ver los ids). Vacio = cierra sin motivo.
-  duplicateLossReasonId: Number(process.env.KOMMO_DUPLICATE_LOSS_REASON_ID) || null,
   // Token para las rutas /admin (ej. POST /admin/unify-test). Si esta vacio,
   // esas rutas quedan deshabilitadas.
   adminToken: process.env.ADMIN_TOKEN || "",

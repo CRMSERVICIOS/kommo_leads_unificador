@@ -2,7 +2,7 @@ import { config } from "../config";
 import { logger } from "../logger";
 import { normalizePhone } from "./phoneNormalizer";
 import { findContactsByPhoneQuery, getContactLeadIds, getLead } from "./kommoClient";
-import { CLOSED_LOST_STATUS_ID, CLOSED_WON_STATUS_ID, unifyDuplicate } from "./duplicateUnifier";
+import { DUPLICATES_PIPELINE_ID, resolveWinner, unifyDuplicate } from "./duplicateUnifier";
 import {
   belongsToDifferentEntity,
   findByPhone,
@@ -72,8 +72,10 @@ export interface ProcessIncomingEntityResult {
  *  - Si no esta en `phone_index`: se indexa y no pasa nada mas.
  *  - Si esta en `phone_index` asociado a OTRO contacto que no comparte
  *    leads con este (los que comparten ya estan fusionados): se registra en
- *    `duplicate_detections` (pending_review) y se fusiona automaticamente
- *    con unifyDuplicate() -- ver `autoUnify` para cuando se deja pendiente.
+ *    `duplicate_detections` (pending_review; ahi existing_* = el lado ya
+ *    indexado y new_* = el del evento, sin importar quien gana) y se
+ *    resuelve automaticamente con unifyDuplicate() -- ver `autoUnify` para
+ *    quien gana y cuando se deja pendiente.
  *
  * Sin avisos externos: la unica accion es la fusion en Kommo.
  */
@@ -108,20 +110,19 @@ export async function processIncomingEntity(
       continue;
     }
 
-    let existingRows = await findByPhone(normalized);
-    if (existingRows.length === 0) {
-      existingRows = await indexUnseenContactsFromKommo(normalized, input);
+    let indexedRows = await findByPhone(normalized);
+    if (indexedRows.length === 0) {
+      indexedRows = await indexUnseenContactsFromKommo(normalized, input);
     }
-    // El ganador es siempre el contacto mas viejo (id de Kommo mas bajo),
-    // no el que llego primero a nuestro indice.
-    const conflicting = existingRows
+    // Se compara contra el contacto indexado mas reciente (id de Kommo mas
+    // alto): despues de una fusion es el ganador vigente.
+    const conflicting = indexedRows
       .filter((row) => belongsToDifferentEntity(row, input.contactId, input.leadId))
-      .sort((a, b) => compareContactIds(a.kommo_contact_id, b.kommo_contact_id));
+      .sort((a, b) => compareIdsDesc(a.kommo_contact_id, b.kommo_contact_id));
 
-    const existing = await findFirstNotYetMerged(conflicting, existingRows, input, normalized);
+    const indexed = await findFirstNotYetMerged(conflicting, indexedRows, input, normalized);
 
-    if (existing) {
-
+    if (indexed) {
       const alreadyRecorded = await findExistingPendingDetection(
         normalized,
         input.contactId,
@@ -131,8 +132,8 @@ export async function processIncomingEntity(
       if (!alreadyRecorded) {
         const detection = await insertDuplicateDetection({
           phoneNormalized: normalized,
-          existingContactId: existing.kommo_contact_id,
-          existingLeadId: existing.kommo_lead_id,
+          existingContactId: indexed.kommo_contact_id,
+          existingLeadId: indexed.kommo_lead_id,
           newContactId: input.contactId,
           newLeadId: input.leadId,
           notes: `Detectado via webhook de ${input.entityType} (fuente: ${input.source})`,
@@ -140,7 +141,7 @@ export async function processIncomingEntity(
 
         duplicatesDetected += 1;
 
-        const pendingReason = await autoUnify(input, existing, normalized);
+        const pendingReason = await autoUnify(input, indexed, normalized);
         if (pendingReason) {
           await appendDetectionNote(detection.id, `Sin fusion automatica: ${pendingReason}`);
         }
@@ -193,8 +194,8 @@ async function findFirstNotYetMerged(
     if (await sharesLeadWithIncoming(row, allRowsForPhone, incomingLeadIds)) {
       logger.info("duplicate_skipped_already_merged", {
         phoneNormalized,
-        existingContactId: row.kommo_contact_id,
-        newContactId: input.contactId,
+        indexedContactId: row.kommo_contact_id,
+        incomingContactId: input.contactId,
         incomingLeadIds: [...incomingLeadIds],
       });
       continue;
@@ -237,45 +238,51 @@ async function sharesLeadWithIncoming(
   }
 }
 
-/** Tope de leads del contacto ganador que se consultan para elegir uno abierto. */
-const MAX_WINNER_LEADS_TO_CHECK = 5;
+/**
+ * Tope de leads del contacto indexado que se consultan. Si tiene mas, queda
+ * para revision manual: con un corte arbitrario se podria elegir mal cual
+ * es su lead abierto.
+ */
+const MAX_INDEXED_LEADS_TO_CHECK = 10;
 
 /**
- * Fusiona automaticamente un duplicado recien registrado. El ganador es
- * siempre el contacto existente. Deja la deteccion en pending_review (para
+ * Resuelve automaticamente un duplicado recien registrado. Gana el lado con
+ * ids de contacto y de lead MAS ALTOS (el mas reciente), venga del indice o
+ * del evento; el perdedor se vincula al contacto ganador y va al embudo
+ * Duplicados (ver unifyDuplicate). Deja la deteccion en pending_review (para
  * revision manual, sin reintentos) cuando:
  *  - DRY_RUN=true (freno de emergencia: solo loguea).
- *  - el evento no trae exactamente UN lead del contacto nuevo (ej: eventos
+ *  - el evento no trae exactamente UN lead del contacto (ej: eventos
  *    "unsorted", cuyo lead todavia no fue aceptado, o contactos con varios
- *    leads: no sabemos cual cerrar).
- *  - el contacto existente no tiene ningun lead abierto: seria un cliente que
- *    vuelve, y cerrar su consulta nueva la sacaria del embudo.
- *  - el contacto "nuevo" es mas viejo (id mas bajo) que el existente: el
- *    ganador deberia ser el nuevo, orden inesperado.
+ *    leads: no sabemos cual comparar).
+ *  - el contacto indexado no tiene exactamente un lead abierto (ninguno:
+ *    cliente que vuelve; varios: no sabemos cual comparar).
+ *  - el contacto y el lead no coinciden en cual lado es mas nuevo.
+ *  - el lead perdedor ya esta cerrado (142/143) o en Duplicados.
  *  - falla cualquier paso de unifyDuplicate (que ya loguea el detalle).
  *
- * Devuelve el motivo por el que quedo pendiente, o null si se fusiono.
+ * Devuelve el motivo por el que quedo pendiente, o null si se resolvio.
  */
 async function autoUnify(
   input: ProcessIncomingEntityInput,
-  existing: PhoneIndexRow,
+  indexed: PhoneIndexRow,
   phoneNormalized: string
 ): Promise<string | null> {
-  const existingContactId = existing.kommo_contact_id;
-  const newContactId = input.contactId;
-  const newLeadIds = input.linkedLeadIds ?? [];
+  const indexedContactId = indexed.kommo_contact_id;
+  const incomingContactId = input.contactId;
+  const incomingLeadIds = input.linkedLeadIds ?? [];
 
   const logContext = {
     phoneNormalized,
-    existingContactId,
-    newContactId,
-    newLeadIds,
+    indexedContactId,
+    incomingContactId,
+    incomingLeadIds,
   };
 
   if (config.dryRun) {
     logger.info(
-      `[DRY RUN] Duplicado detectado: telefono ${phoneNormalized} coincide con contacto existente ${existingContactId}. ` +
-        `Se fusionaria el contacto ${newContactId} (leads ${newLeadIds.join(", ") || "-"}), pero no se ejecuta (DRY_RUN=true).`,
+      `[DRY RUN] Duplicado detectado: telefono ${phoneNormalized} coincide con el contacto indexado ${indexedContactId}. ` +
+        `Se resolveria contra el contacto ${incomingContactId} (leads ${incomingLeadIds.join(", ") || "-"}), pero no se ejecuta (DRY_RUN=true).`,
       logContext
     );
     return "DRY_RUN=true";
@@ -286,31 +293,47 @@ async function autoUnify(
     return reason;
   };
 
-  if (!existingContactId || !newContactId) {
-    return skip("falta el contacto existente o el nuevo");
+  if (!indexedContactId || !incomingContactId) {
+    return skip("falta el contacto indexado o el del evento");
   }
-  if (compareContactIds(newContactId, existingContactId) < 0) {
-    return skip("orden de IDs inesperado, revisar a mano");
-  }
-  if (newLeadIds.length !== 1) {
+  if (incomingLeadIds.length !== 1) {
     return skip(
-      newLeadIds.length === 0
-        ? "el evento no trae lead del contacto nuevo (ej: unsorted)"
-        : "el contacto nuevo tiene varios leads vinculados"
+      incomingLeadIds.length === 0
+        ? "el evento no trae lead del contacto (ej: unsorted)"
+        : "el contacto del evento tiene varios leads vinculados"
     );
   }
-  const newLeadId = newLeadIds[0];
+  const incoming = { contactId: incomingContactId, leadId: incomingLeadIds[0] };
 
   try {
-    const winnerLeadId = await findOpenWinnerLead(existing, newLeadId);
-    if (!winnerLeadId) {
-      return skip("el contacto existente no tiene leads abiertos");
+    const indexedOpenLeads = await findOpenLeadsOf(indexed, incomingLeadIds);
+    if (indexedOpenLeads === null) {
+      return skip("el contacto indexado tiene demasiados leads, revisar a mano");
+    }
+    if (indexedOpenLeads.length !== 1) {
+      return skip(
+        indexedOpenLeads.length === 0
+          ? "el contacto indexado no tiene leads abiertos"
+          : "el contacto indexado tiene varios leads abiertos"
+      );
     }
 
-    const result = await unifyDuplicate(
-      { existingContactId, existingLeadId: winnerLeadId, newContactId, newLeadId },
-      { lossReasonId: config.duplicateLossReasonId }
-    );
+    const pair = resolveWinner(incoming, { contactId: indexedContactId, leadId: indexedOpenLeads[0] });
+    if (!pair) {
+      return skip("los ids de contacto y de lead no coinciden en cual es mas nuevo, revisar a mano");
+    }
+    // El lead indexado ya se filtro por abierto; el del evento se verifica
+    // solo si es el que se va a mover.
+    if (pair.loser === incoming && !isOpenLead(await getLead(incoming.leadId))) {
+      return skip("el lead perdedor ya esta cerrado o en Duplicados");
+    }
+
+    const result = await unifyDuplicate({
+      winnerContactId: pair.winner.contactId,
+      winnerLeadId: pair.winner.leadId,
+      loserContactId: pair.loser.contactId,
+      loserLeadId: pair.loser.leadId,
+    });
 
     if (!result.ok) {
       const failed = result.steps.find((s) => s.status === "failed");
@@ -328,12 +351,12 @@ async function autoUnify(
   }
 }
 
-/** Compara ids numericos de Kommo (los mas bajos son los mas viejos). */
-function compareContactIds(a: string | null, b: string | null): number {
-  const na = a != null && /^\d+$/.test(a) ? Number(a) : Number.POSITIVE_INFINITY;
-  const nb = b != null && /^\d+$/.test(b) ? Number(b) : Number.POSITIVE_INFINITY;
+/** Orden descendente por id numerico de Kommo (el mas reciente primero; no numericos al final). */
+function compareIdsDesc(a: string | null, b: string | null): number {
+  const na = a != null && /^\d+$/.test(a) ? Number(a) : Number.NEGATIVE_INFINITY;
+  const nb = b != null && /^\d+$/.test(b) ? Number(b) : Number.NEGATIVE_INFINITY;
   if (na === nb) return 0;
-  return na < nb ? -1 : 1;
+  return na > nb ? -1 : 1;
 }
 
 /** Cantidad de digitos finales del telefono que se mandan a la busqueda de Kommo. */
@@ -370,7 +393,7 @@ async function indexUnseenContactsFromKommo(
     .filter((c) =>
       c.phones.some((raw) => normalizePhone(raw, config.defaultCountryCode) === phoneNormalized)
     )
-    .sort((a, b) => compareContactIds(a.id, b.id));
+    .sort((a, b) => compareIdsDesc(a.id, b.id));
 
   const rows: PhoneIndexRow[] = [];
   for (const contact of matches) {
@@ -394,26 +417,42 @@ async function indexUnseenContactsFromKommo(
   return rows;
 }
 
-/**
- * Primer lead ABIERTO (no 142/143) del contacto ganador: el que tiene en
- * phone_index y, si no, los que Kommo tiene vinculados.
- */
-async function findOpenWinnerLead(
-  existing: PhoneIndexRow,
-  newLeadId: string
-): Promise<string | null> {
-  const fromKommo = existing.kommo_contact_id
-    ? await getContactLeadIds(existing.kommo_contact_id)
-    : [];
-  const candidates = [...new Set([existing.kommo_lead_id, ...fromKommo])]
-    .filter((id): id is string => !!id && id !== newLeadId)
-    .slice(0, MAX_WINNER_LEADS_TO_CHECK);
+/** Etapas de sistema de Kommo, iguales en todos los embudos. */
+const CLOSED_WON_STATUS_ID = 142;
+const CLOSED_LOST_STATUS_ID = 143;
 
+/**
+ * Abierto = no cerrado (142/143) y no movido ya al embudo Duplicados (un
+ * perdedor anterior sigue vinculado a su contacto original como secundario).
+ */
+function isOpenLead(lead: { pipeline_id: number; status_id: number }): boolean {
+  return (
+    lead.status_id !== CLOSED_WON_STATUS_ID &&
+    lead.status_id !== CLOSED_LOST_STATUS_ID &&
+    lead.pipeline_id !== DUPLICATES_PIPELINE_ID
+  );
+}
+
+/**
+ * Leads abiertos del contacto indexado: el que tiene en phone_index y los
+ * que Kommo tiene vinculados, sin los del evento. null si son demasiados
+ * para revisarlos todos.
+ */
+async function findOpenLeadsOf(
+  indexed: PhoneIndexRow,
+  excludeLeadIds: string[]
+): Promise<string[] | null> {
+  const fromKommo = indexed.kommo_contact_id
+    ? await getContactLeadIds(indexed.kommo_contact_id)
+    : [];
+  const candidates = [...new Set([indexed.kommo_lead_id, ...fromKommo])].filter(
+    (id): id is string => !!id && !excludeLeadIds.includes(id)
+  );
+  if (candidates.length > MAX_INDEXED_LEADS_TO_CHECK) return null;
+
+  const open: string[] = [];
   for (const leadId of candidates) {
-    const lead = await getLead(leadId);
-    if (lead.status_id !== CLOSED_WON_STATUS_ID && lead.status_id !== CLOSED_LOST_STATUS_ID) {
-      return leadId;
-    }
+    if (isOpenLead(await getLead(leadId))) open.push(leadId);
   }
-  return null;
+  return open;
 }

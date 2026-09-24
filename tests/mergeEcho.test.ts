@@ -2,11 +2,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * Reproduce el "eco de fusion" encontrado con Matias Franco (2026-09-23):
- * unifyDuplicate vincula el lead nuevo al contacto ganador, Kommo manda un
- * contacts.update del ganador, y el detector lo tomaba como un duplicado
+ * unifyDuplicate vincula el lead perdedor al contacto ganador, Kommo manda
+ * un contacts.update del ganador, y el detector lo tomaba como un duplicado
  * nuevo con los roles invertidos. Usa fakes con estado (DB en memoria +
- * Kommo en memoria) para que el efecto real de la fusion (el link) sea lo
- * que ve el evento siguiente.
+ * Kommo en memoria) para que el efecto real de la fusion (el link y el
+ * cambio de embudo) sea lo que ve el evento siguiente.
  */
 
 type PhoneRow = {
@@ -33,14 +33,14 @@ const state = vi.hoisted(() => ({
   seenEvents: new Set<string>(),
   /** contacto -> leads vinculados, como lo ve Kommo. */
   kommoContactLeads: new Map<string, Set<string>>(),
-  notes: [] as { entityType: string; entityId: string }[],
-  /** lead -> status_id, como lo ve Kommo. */
-  leadStatus: new Map<string, number>(),
-  tags: [] as { entityType: string; entityId: string; tag: string }[],
+  /** lead -> embudo/etapa, como lo ve Kommo. */
+  leadStage: new Map<string, { pipeline_id: number; status_id: number }>(),
+  /** Cada escritura que recibio Kommo: [endpoint, lead]. */
+  writes: [] as [string, string][],
 }));
 
 vi.mock("../src/config", () => ({
-  config: { defaultCountryCode: "54", dryRun: false, duplicateLossReasonId: 38469131 },
+  config: { defaultCountryCode: "54", dryRun: false },
 }));
 
 vi.mock("../src/db/phoneIndex", async () => {
@@ -125,42 +125,30 @@ vi.mock("../src/services/kommoClient", () => {
     getContactLeadIds: async (contactId: string) => [...leadsOf(contactId)],
     findContactsByPhoneQuery: async () => [],
     linkContactToLead: async (leadId: string, contactId: string) => {
+      state.writes.push(["link", leadId]);
       leadsOf(contactId).add(leadId);
       return { _embedded: { links: [{ to_entity_id: Number(contactId) }] } };
     },
-    createNote: async (entityType: string, entityId: string) => {
-      state.notes.push({ entityType, entityId });
-      return {};
-    },
-    addTagsToEntity: async (entityType: string, entityId: string, tags: string[]) => {
-      for (const tag of tags) state.tags.push({ entityType, entityId, tag });
-      return {};
-    },
     getLead: async (leadId: string) => ({
       id: Number(leadId),
-      pipeline_id: 14491207,
-      status_id: state.leadStatus.get(leadId) ?? 111934987,
+      ...(state.leadStage.get(leadId) ?? { pipeline_id: 14491207, status_id: 111934987 }),
     }),
-    updateLeadStatus: async (leadId: string, _pipelineId: number, statusId: number) => {
-      state.leadStatus.set(leadId, statusId);
+    moveLeadToStage: async (leadId: string, pipelineId: number, statusId: number) => {
+      state.writes.push(["move", leadId]);
+      state.leadStage.set(leadId, { pipeline_id: pipelineId, status_id: statusId });
       return {};
-    },
-    addNote: async (entityType: string, entityId: string) => {
-      state.notes.push({ entityType, entityId });
-    },
-    addTag: async (entityType: string, entityId: string, tag: string) => {
-      state.tags.push({ entityType, entityId, tag });
     },
   };
 });
 
 import { extractLinkedLeadIds, processIncomingEntity } from "../src/services/duplicateDetector";
-import { unifyDuplicate } from "../src/services/duplicateUnifier";
+import { DUPLICATES_PIPELINE_ID, DUPLICATES_STATUS_ID } from "../src/services/duplicateUnifier";
 
-// IDs reales del caso Matias Franco.
+// IDs reales del caso Matias Franco. Gana el mas nuevo (ids mas altos).
 const PHONE_RAW = "+5493777808738";
-const WINNER = { contactId: "40486170", leadId: "22626166" };
-const LOSER = { contactId: "40486762", leadId: "22626774" };
+const OLDER = { contactId: "40486170", leadId: "22626166" };
+const NEWER = { contactId: "40486762", leadId: "22626774" };
+const IN_DUPLICATES = { pipeline_id: DUPLICATES_PIPELINE_ID, status_id: DUPLICATES_STATUS_ID };
 
 /** Arma el input como lo hace routes/webhooks.ts para un contacts.add/update. */
 function contactEvent(contactId: string, linkedLeads: string[], extra: Record<string, unknown> = {}) {
@@ -188,83 +176,114 @@ beforeEach(() => {
   state.detections = [];
   state.seenEvents = new Set();
   state.kommoContactLeads = new Map();
-  state.notes = [];
-  state.tags = [];
-  state.leadStatus = new Map();
+  state.leadStage = new Map();
+  state.writes = [];
 });
 
 describe("eco de fusion", () => {
-  it("duplicado -> fusion automatica -> el contacts.update del ganador NO genera deteccion inversa", async () => {
-    setKommoLinks(WINNER.contactId, [WINNER.leadId]);
-    setKommoLinks(LOSER.contactId, [LOSER.leadId]);
+  it("duplicado -> resolucion automatica -> los contacts.update posteriores NO generan deteccion inversa", async () => {
+    setKommoLinks(OLDER.contactId, [OLDER.leadId]);
+    setKommoLinks(NEWER.contactId, [NEWER.leadId]);
 
     // 1. Entra el contacto original, se indexa.
-    await processIncomingEntity(contactEvent(WINNER.contactId, [WINNER.leadId]));
-    // 2. Entra el nuevo con el mismo telefono: duplicado real -> se fusiona solo.
-    const detection = await processIncomingEntity(contactEvent(LOSER.contactId, [LOSER.leadId]));
+    await processIncomingEntity(contactEvent(OLDER.contactId, [OLDER.leadId]));
+    // 2. Entra el nuevo con el mismo telefono: duplicado real -> se resuelve solo.
+    const detection = await processIncomingEntity(contactEvent(NEWER.contactId, [NEWER.leadId]));
     expect(detection.duplicatesDetected).toBe(1);
     expect(state.detections).toHaveLength(1);
     expect(state.detections[0].status).toBe("reviewed_merged");
-    expect(state.kommoContactLeads.get(WINNER.contactId)).toEqual(new Set([WINNER.leadId, LOSER.leadId]));
-    expect(state.leadStatus.get(LOSER.leadId)).toBe(143);
-    expect(state.tags).toEqual([{ entityType: "leads", entityId: LOSER.leadId, tag: "duplicado-fusionado" }]);
+    // El lead viejo queda colgando del contacto nuevo...
+    expect(state.kommoContactLeads.get(NEWER.contactId)).toEqual(new Set([NEWER.leadId, OLDER.leadId]));
+    // ...sin perder su contacto original (secundario), y en el embudo Duplicados.
+    expect(state.kommoContactLeads.get(OLDER.contactId)).toEqual(new Set([OLDER.leadId]));
+    expect(state.leadStage.get(OLDER.leadId)).toEqual(IN_DUPLICATES);
 
-    const notesBeforeEcho = state.notes.length;
-    const tagsBeforeEcho = state.tags.length;
+    const writesBeforeEcho = state.writes.length;
 
     // 3. Eco: Kommo manda contacts.update del GANADOR, ahora con los dos leads...
     const echo = await processIncomingEntity(
-      contactEvent(WINNER.contactId, [WINNER.leadId, LOSER.leadId], { updated_at: "after-merge" })
+      contactEvent(NEWER.contactId, [NEWER.leadId, OLDER.leadId], { updated_at: "after-merge" })
     );
-    // ...y un contacts.update del perdedor (su lead cambio de estado).
+    // ...y un contacts.update del perdedor (su lead cambio de embudo).
     const loserEcho = await processIncomingEntity(
-      contactEvent(LOSER.contactId, [LOSER.leadId], { updated_at: "after-merge" })
+      contactEvent(OLDER.contactId, [OLDER.leadId], { updated_at: "after-merge" })
     );
 
     expect(echo.duplicatesDetected).toBe(0);
     expect(loserEcho.duplicatesDetected).toBe(0);
     expect(state.detections).toHaveLength(1);
     expect(state.detections.some((d) => d.status === "pending_review")).toBe(false);
-    expect(state.notes).toHaveLength(notesBeforeEcho);
-    expect(state.tags).toHaveLength(tagsBeforeEcho);
+    expect(state.writes).toHaveLength(writesBeforeEcho);
+  });
+
+  it("el lead ganador queda 100% intacto: Kommo no recibe ninguna escritura sobre el", async () => {
+    setKommoLinks(OLDER.contactId, [OLDER.leadId]);
+    setKommoLinks(NEWER.contactId, [NEWER.leadId]);
+
+    await processIncomingEntity(contactEvent(OLDER.contactId, [OLDER.leadId]));
+    await processIncomingEntity(contactEvent(NEWER.contactId, [NEWER.leadId]));
+
+    expect(state.writes).toEqual([
+      ["link", OLDER.leadId],
+      ["move", OLDER.leadId],
+    ]);
+    expect(state.leadStage.has(NEWER.leadId)).toBe(false);
+  });
+
+  it("si el evento que llega es el del contacto VIEJO, igual pierde el viejo", async () => {
+    setKommoLinks(OLDER.contactId, [OLDER.leadId]);
+    setKommoLinks(NEWER.contactId, [NEWER.leadId]);
+
+    // Se indexa primero el nuevo (ej: webhook del viejo perdido).
+    await processIncomingEntity(contactEvent(NEWER.contactId, [NEWER.leadId]));
+    await processIncomingEntity(contactEvent(OLDER.contactId, [OLDER.leadId]));
+
+    expect(state.leadStage.get(OLDER.leadId)).toEqual(IN_DUPLICATES);
+    expect(state.kommoContactLeads.get(NEWER.contactId)).toEqual(new Set([NEWER.leadId, OLDER.leadId]));
+    expect(state.writes.map(([, lead]) => lead)).not.toContain(NEWER.leadId);
+  });
+
+  it("un tercer contacto mas nuevo se resuelve contra el ganador vigente, sin re-mover el lead que ya esta en Duplicados", async () => {
+    const THIRD = { contactId: "40490000", leadId: "22630000" };
+    setKommoLinks(OLDER.contactId, [OLDER.leadId]);
+    setKommoLinks(NEWER.contactId, [NEWER.leadId]);
+    setKommoLinks(THIRD.contactId, [THIRD.leadId]);
+
+    await processIncomingEntity(contactEvent(OLDER.contactId, [OLDER.leadId]));
+    await processIncomingEntity(contactEvent(NEWER.contactId, [NEWER.leadId]));
+    state.writes = [];
+
+    const result = await processIncomingEntity(contactEvent(THIRD.contactId, [THIRD.leadId]));
+
+    expect(result.duplicatesDetected).toBe(1);
+    expect(state.writes).toEqual([
+      ["link", NEWER.leadId],
+      ["move", NEWER.leadId],
+    ]);
+    expect(state.leadStage.get(NEWER.leadId)).toEqual(IN_DUPLICATES);
+    expect(state.detections.every((d) => d.status === "reviewed_merged")).toBe(true);
   });
 
   it("el eco tampoco salta si la fila del perdedor es vieja (sin lead en phone_index): consulta a Kommo", async () => {
-    // Estado real de la DB: el perdedor 40486762 se indexo antes de guardar leads.
+    // Fila vieja del perdedor, indexada antes de guardar leads.
     state.phoneRows.push({
       id: 280,
       phone_normalized: "5493777808738",
-      kommo_contact_id: LOSER.contactId,
+      kommo_contact_id: OLDER.contactId,
       kommo_lead_id: null,
       source: "unknown",
       created_at: "2026-09-23 18:33:47",
     });
-    // Estado real en Kommo despues de la fusion (leido por API el 2026-09-23).
-    setKommoLinks(WINNER.contactId, [WINNER.leadId, LOSER.leadId]);
-    setKommoLinks(LOSER.contactId, [LOSER.leadId]);
+    // Estado en Kommo despues de la fusion.
+    setKommoLinks(NEWER.contactId, [NEWER.leadId, OLDER.leadId]);
+    setKommoLinks(OLDER.contactId, [OLDER.leadId]);
+    state.leadStage.set(OLDER.leadId, IN_DUPLICATES);
 
     const echo = await processIncomingEntity(
-      contactEvent(WINNER.contactId, [WINNER.leadId, LOSER.leadId])
+      contactEvent(NEWER.contactId, [NEWER.leadId, OLDER.leadId])
     );
 
     expect(echo.duplicatesDetected).toBe(0);
     expect(state.detections).toHaveLength(0);
-  });
-
-  it("un duplicado real (sin leads en comun) se sigue detectando", async () => {
-    setKommoLinks(WINNER.contactId, [WINNER.leadId]);
-    setKommoLinks(LOSER.contactId, [LOSER.leadId]);
-
-    await processIncomingEntity(contactEvent(WINNER.contactId, [WINNER.leadId]));
-    const result = await processIncomingEntity(contactEvent(LOSER.contactId, [LOSER.leadId]));
-
-    expect(result.duplicatesDetected).toBe(1);
-    expect(state.leadStatus.get(LOSER.leadId)).toBe(143);
-    expect(state.detections[0]).toMatchObject({
-      existing_contact_id: WINNER.contactId,
-      existing_lead_id: WINNER.leadId,
-      new_contact_id: LOSER.contactId,
-      new_lead_id: LOSER.leadId,
-    });
   });
 });

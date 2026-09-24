@@ -5,12 +5,7 @@ vi.mock("../src/config", () => ({
   getKommoBaseUrl: () => "https://rudas.kommo.com/api/v4",
 }));
 
-import {
-  addTagsToEntity,
-  createNote,
-  linkContactToLead,
-  updateLeadStatus,
-} from "../src/services/kommoClient";
+import { linkContactToLead, moveLeadToStage } from "../src/services/kommoClient";
 
 const fetchMock = vi.fn();
 
@@ -29,7 +24,7 @@ function lastRequest() {
   return { url, method: init.method, body: JSON.parse(String(init.body)) };
 }
 
-// Shapes confirmados contra developers.kommo.com (link-entities, add-notes,
+// Shapes confirmados contra developers.kommo.com (link-entities,
 // updating-single-lead).
 describe("kommoClient - shapes de request", () => {
   it("linkContactToLead: POST /leads/{id}/link con is_main", async () => {
@@ -42,41 +37,13 @@ describe("kommoClient - shapes de request", () => {
     });
   });
 
-  it("createNote: POST /leads/notes con entity_id en el body", async () => {
-    await createNote("leads", "22627634", "hola");
+  it("moveLeadToStage: PATCH /leads/{id} solo con pipeline_id + status_id", async () => {
+    await moveLeadToStage("22627454", 14517971, 112145359);
 
     expect(lastRequest()).toEqual({
-      url: "https://rudas.kommo.com/api/v4/leads/notes",
-      method: "POST",
-      body: [{ entity_id: 22627634, note_type: "common", params: { text: "hola" } }],
-    });
-  });
-
-  it("addTagsToEntity: usa tags_to_add (no _embedded.tags, que pisa los existentes)", async () => {
-    await addTagsToEntity("leads", "22627634", ["duplicado-fusionado"]);
-
-    const req = lastRequest();
-    expect(req).toEqual({
-      url: "https://rudas.kommo.com/api/v4/leads/22627634",
+      url: "https://rudas.kommo.com/api/v4/leads/22627454",
       method: "PATCH",
-      body: { tags_to_add: [{ name: "duplicado-fusionado" }] },
-    });
-    expect(req.body._embedded).toBeUndefined();
-  });
-
-  it("updateLeadStatus: incluye loss_reason_id cuando se pasa", async () => {
-    await updateLeadStatus("22627634", 14491207, 143, 38469131);
-
-    expect(lastRequest().body).toEqual({ pipeline_id: 14491207, status_id: 143, loss_reason_id: 38469131 });
-  });
-
-  it("updateLeadStatus: PATCH /leads/{id} con pipeline_id + status_id", async () => {
-    await updateLeadStatus("22627634", 14491207, 143);
-
-    expect(lastRequest()).toEqual({
-      url: "https://rudas.kommo.com/api/v4/leads/22627634",
-      method: "PATCH",
-      body: { pipeline_id: 14491207, status_id: 143 },
+      body: { pipeline_id: 14517971, status_id: 112145359 },
     });
   });
 

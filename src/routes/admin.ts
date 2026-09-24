@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { config } from "../config";
 import { logger } from "../logger";
-import { unifyDuplicate } from "../services/duplicateUnifier";
+import { resolveWinner, unifyDuplicate } from "../services/duplicateUnifier";
 
 export const adminRouter = Router();
 
@@ -42,53 +42,48 @@ function readId(value: unknown): string | null {
 
 /**
  * POST /admin/unify-test
- * { existingContactId, existingLeadId?, newContactId, newLeadId, dryRun? }
+ * { winnerContactId, winnerLeadId, loserContactId, loserLeadId, dryRun? }
  *
- * Disparo MANUAL de la fusion contra un caso puntual (la misma que el
+ * Disparo MANUAL de la resolucion contra un caso puntual (la misma que el
  * detector corre automaticamente). Es independiente de DRY_RUN
  * del .env (que sigue gobernando solo al detector): llamar a este endpoint
  * escribe en Kommo, salvo que se mande `dryRun: true` en el body.
+ * Rechaza el pedido si el ganador no es el de ids mas altos (misma regla
+ * que el detector).
  */
 adminRouter.post("/unify-test", async (req, res) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
 
-  const existingContactId = readId(body.existingContactId);
-  const newContactId = readId(body.newContactId);
-  const newLeadId = readId(body.newLeadId);
-  const existingLeadId =
-    body.existingLeadId == null || body.existingLeadId === "" ? null : readId(body.existingLeadId);
+  const fields = ["winnerContactId", "winnerLeadId", "loserContactId", "loserLeadId"] as const;
+  const ids = Object.fromEntries(fields.map((f) => [f, readId(body[f])])) as Record<
+    (typeof fields)[number],
+    string | null
+  >;
 
-  const invalid: string[] = [];
-  if (!existingContactId) invalid.push("existingContactId");
-  if (!newContactId) invalid.push("newContactId");
-  if (!newLeadId) invalid.push("newLeadId");
-  if (body.existingLeadId != null && body.existingLeadId !== "" && !existingLeadId) {
-    invalid.push("existingLeadId");
-  }
+  const invalid = fields.filter((f) => !ids[f]);
   if (invalid.length > 0) {
     res.status(400).json({ error: "invalid_ids", fields: invalid });
     return;
   }
 
-  if (existingContactId === newContactId || existingLeadId === newLeadId) {
+  const winner = { contactId: ids.winnerContactId!, leadId: ids.winnerLeadId! };
+  const loser = { contactId: ids.loserContactId!, leadId: ids.loserLeadId! };
+  if (resolveWinner(winner, loser)?.winner !== winner) {
     res.status(400).json({
-      error: "same_entity",
-      reason: "el contacto/lead existente y el nuevo no pueden ser el mismo",
+      error: "invalid_winner",
+      reason: "el ganador tiene que tener el id de contacto Y el id de lead mas altos que el perdedor",
     });
     return;
   }
 
   const result = await unifyDuplicate(
     {
-      existingContactId: existingContactId!,
-      existingLeadId,
-      newContactId: newContactId!,
-      newLeadId: newLeadId!,
+      winnerContactId: winner.contactId,
+      winnerLeadId: winner.leadId,
+      loserContactId: loser.contactId,
+      loserLeadId: loser.leadId,
     },
-    {
-      dryRun: body.dryRun === true || body.dryRun === "true",
-      lossReasonId: config.duplicateLossReasonId,
-    }
+    { dryRun: body.dryRun === true || body.dryRun === "true" }
   );
 
   res.status(result.ok ? 200 : 502).json(result);

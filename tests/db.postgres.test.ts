@@ -29,7 +29,6 @@ vi.mock("../src/config", () => ({
     databaseCaCert: "",
     defaultCountryCode: "54",
     dryRun: false,
-    duplicateLossReasonId: 38469131,
   },
 }));
 
@@ -40,11 +39,16 @@ vi.mock("../src/services/kommoClient", () => ({
   listContactsPage: mocks.listContactsPage,
 }));
 
-vi.mock("../src/services/duplicateUnifier", () => ({
-  CLOSED_WON_STATUS_ID: 142,
-  CLOSED_LOST_STATUS_ID: 143,
-  unifyDuplicate: mocks.unifyDuplicate,
-}));
+vi.mock("../src/services/duplicateUnifier", async () => {
+  const actual = await vi.importActual<typeof import("../src/services/duplicateUnifier")>(
+    "../src/services/duplicateUnifier"
+  );
+  return {
+    DUPLICATES_PIPELINE_ID: actual.DUPLICATES_PIPELINE_ID,
+    resolveWinner: actual.resolveWinner,
+    unifyDuplicate: mocks.unifyDuplicate,
+  };
+});
 
 import { closeDb, getPool, runMigrations } from "../src/db";
 import {
@@ -197,10 +201,12 @@ describe("detector contra Postgres real", () => {
       status: "pending_review", // el unifier esta mockeado; el real lo pasa a reviewed_merged
     });
     expect(mocks.unifyDuplicate).toHaveBeenCalledTimes(1);
-    expect(mocks.unifyDuplicate).toHaveBeenCalledWith(
-      { existingContactId: "40490001", existingLeadId: "22630001", newContactId: "40490002", newLeadId: "22630002" },
-      { lossReasonId: 38469131 }
-    );
+    expect(mocks.unifyDuplicate).toHaveBeenCalledWith({
+      winnerContactId: "40490002",
+      winnerLeadId: "22630002",
+      loserContactId: "40490001",
+      loserLeadId: "22630001",
+    });
     expect(await findByPhone("5491100000009")).toHaveLength(2);
   });
 
@@ -214,7 +220,7 @@ describe("detector contra Postgres real", () => {
 });
 
 describe("detector + fallback a Kommo contra Postgres real", () => {
-  it("telefono no indexado que existe en Kommo en un contacto mas viejo: lo indexa, registra y fusiona", async () => {
+  it("telefono no indexado que existe en Kommo en un contacto mas viejo: lo indexa, registra y ese pierde", async () => {
     mocks.findContactsByPhoneQuery.mockResolvedValue([
       { id: "40400000", phones: ["+541100000009"], leadIds: ["22600000"] },
     ]);
@@ -236,15 +242,18 @@ describe("detector + fallback a Kommo contra Postgres real", () => {
       ["40400000", "kommo_lookup"],
       ["40490002", "unknown"],
     ]);
-    expect(mocks.unifyDuplicate).toHaveBeenCalledWith(
-      expect.objectContaining({ existingContactId: "40400000", newContactId: "40490002" }),
-      expect.anything()
-    );
+    expect(mocks.unifyDuplicate).toHaveBeenCalledWith({
+      winnerContactId: "40490002",
+      winnerLeadId: "22630002",
+      loserContactId: "40400000",
+      loserLeadId: "22600000",
+    });
   });
 
-  it("orden de ids inesperado: queda pending_review con el motivo en notes", async () => {
+  it("contacto y lead no coinciden en cual es mas nuevo: queda pending_review con el motivo en notes", async () => {
+    // Contacto de Kommo mas nuevo que el del evento, pero con un lead mas viejo.
     mocks.findContactsByPhoneQuery.mockResolvedValue([
-      { id: "40499999", phones: ["+5491100000009"], leadIds: ["22639999"] },
+      { id: "40499999", phones: ["+5491100000009"], leadIds: ["22620000"] },
     ]);
 
     await processIncomingEntity({
@@ -259,7 +268,9 @@ describe("detector + fallback a Kommo contra Postgres real", () => {
     });
 
     const [detection] = await listDetectionsByStatus("pending_review");
-    expect(detection.notes).toContain("Sin fusion automatica: orden de IDs inesperado, revisar a mano");
+    expect(detection.notes).toContain(
+      "Sin fusion automatica: los ids de contacto y de lead no coinciden en cual es mas nuevo, revisar a mano"
+    );
     expect(mocks.unifyDuplicate).not.toHaveBeenCalled();
   });
 });

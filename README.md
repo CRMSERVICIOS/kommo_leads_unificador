@@ -104,8 +104,7 @@ Ver `.env.example`. Resumen:
 | `SLACK_WEBHOOK_URL` | URL de un Incoming Webhook de Slack. Opcional: si no esta seteado, solo se loguea. |
 | `DATABASE_URL` | Connection string de Postgres, ej. `postgresql://user:pass@host:25060/db?sslmode=require`. Obligatoria. |
 | `DATABASE_CA_CERT` | CA del Postgres administrado (en DO App Platform: `${<db>.CA_CERT}`). Opcional: sin ella la conexion va cifrada pero sin verificar la CA. |
-| `DRY_RUN` | Freno de emergencia. `true` = solo loguea los duplicados, sin fusionar. Default `false`. |
-| `KOMMO_DUPLICATE_LOSS_REASON_ID` | Motivo de perdida con el que se cierra el lead duplicado. |
+| `DRY_RUN` | Freno de emergencia. `true` = solo loguea los duplicados, sin resolverlos. Default `false`. |
 | `ADMIN_TOKEN` | Token para `POST /admin/unify-test`. Vacio = deshabilitado. |
 | `PORT` | Puerto HTTP. Default `3000`. |
 | `DEFAULT_COUNTRY_CODE` | Codigo de pais por defecto para telefonos sin codigo explicito. Default `54` (Argentina). |
@@ -144,14 +143,6 @@ verificar apenas se tengan credenciales:
     sobre `utm_source` / nombres de campo; se puede overridear pasando
     `?source=facebook_ads` o `?source=whatsapp` en la URL del webhook si se
     registran endpoints separados por integracion).
-
-- **`src/services/kommoClient.ts`**: los wrappers de `addNote`, `addTag` y
-  `searchContactsByPhone` estan escritos siguiendo la documentacion publica
-  de la API v4 (https://developers.kommo.com/reference), pero sin probar
-  contra una cuenta real. En particular, `addTag` usa un `PATCH` que podria
-  pisar los tags existentes en vez de agregarlos — hay que confirmar el
-  comportamiento real y, si hace falta, hacer primero un `GET` del
-  lead/contacto para mergear tags antes de mandar el `PATCH`.
 
 - **Validacion de origen del webhook**: `src/middleware/verifyKommoWebhook.ts`
   valida hoy que `account.subdomain` del payload coincida con
