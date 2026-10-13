@@ -1,50 +1,92 @@
 import { config, getKommoBaseUrl } from "../config";
 import { logger } from "../logger";
 
+// 403/429/5xx pueden ser transitorios (rate limiting de Kommo/nginx).
+// 400/401/404 son errores permanentes del cliente: no se reintenta.
+const RETRYABLE_STATUSES = new Set([403, 429, 500, 502, 503, 504]);
+
+// 3 reintentos = 4 intentos totales. Delays aprox: 1s, 2s, 4s.
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Backoff exponencial con ±25% de jitter para no sincronizar reintentos. */
+function backoffMs(retryIndex: number): number {
+  const base = BASE_DELAY_MS * Math.pow(2, retryIndex);
+  const jitter = base * 0.25 * (Math.random() * 2 - 1);
+  return Math.round(base + jitter);
+}
+
 /**
  * Wrapper minimo sobre la API v4 de Kommo (https://developers.kommo.com/reference).
- *
- * IMPORTANTE: nada de esto fue probado todavia contra una cuenta real. Los
- * shapes de request/response de abajo son los que documenta Kommo v4 al
- * momento de escribir esto, pero hay TODOs puntuales donde conviene
- * verificar en cuanto tengamos credenciales (KOMMO_SUBDOMAIN +
- * KOMMO_LONG_LIVED_TOKEN reales).
+ * Reintenta automáticamente en errores transitorios (403/429/5xx) con backoff
+ * exponencial. En cada fallo loguea los response headers completos (clave para
+ * diagnosticar si es rate limiting de Kommo, Cloudflare, o un 403 de nginx).
  */
-
 async function kommoFetch<T>(
   path: string,
   init?: RequestInit
 ): Promise<T> {
   const url = `${getKommoBaseUrl()}${path}`;
-
-  const response = await fetch(url, {
+  const options: RequestInit = {
     ...init,
     headers: {
       Authorization: `Bearer ${config.kommoLongLivedToken}`,
       "Content-Type": "application/json",
       ...(init?.headers || {}),
     },
-  });
+  };
 
-  if (!response.ok) {
-    const bodyText = await response.text().catch(() => "");
-    logger.error("kommo_api_error", {
-      url,
-      status: response.status,
-      statusText: response.statusText,
-      body: bodyText,
-    });
-    throw new Error(
-      `Kommo API error ${response.status} en ${path}: ${bodyText}`
-    );
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      await sleep(backoffMs(attempt - 1));
+    }
+
+    const response = await fetch(url, options);
+
+    if (!response.ok) {
+      const responseHeaders = Object.fromEntries(response.headers.entries());
+      const isRetryable = RETRYABLE_STATUSES.has(response.status);
+
+      if (isRetryable && attempt < MAX_RETRIES) {
+        // Drenar el body para liberar la conexión, pero no lo usamos todavía.
+        await response.text().catch(() => "");
+        logger.warn("kommo_api_error_retrying", {
+          url,
+          status: response.status,
+          responseHeaders,
+          attempt: attempt + 1,
+          maxAttempts: MAX_RETRIES + 1,
+        });
+        continue;
+      }
+
+      // Último intento o error no reintentable: loguear con headers + body y lanzar.
+      const bodyText = await response.text().catch(() => "");
+      logger.error("kommo_api_error", {
+        url,
+        status: response.status,
+        statusText: response.statusText,
+        responseHeaders,
+        body: bodyText,
+        totalAttempts: attempt + 1,
+      });
+      throw new Error(
+        `Kommo API error ${response.status} en ${path}: ${bodyText}`
+      );
+    }
+
+    // 204 No Content u otras respuestas sin body.
+    const text = await response.text();
+    if (!text) {
+      return undefined as unknown as T;
+    }
+    return JSON.parse(text) as T;
   }
 
-  // 204 No Content u otras respuestas sin body.
-  const text = await response.text();
-  if (!text) {
-    return undefined as unknown as T;
-  }
-  return JSON.parse(text) as T;
+  // Inalcanzable (el loop siempre sale por return o throw), pero TypeScript lo exige.
+  throw new Error(`Kommo API: se agotaron los reintentos para ${path}`);
 }
 
 /** Contacto de Kommo reducido a lo que usa el indice de telefonos. */
