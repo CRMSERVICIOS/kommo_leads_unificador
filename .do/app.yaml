@@ -1,0 +1,52 @@
+# Spec de DigitalOcean App Platform. Se aplica desde la UI (Settings > App Spec)
+# o con `doctl apps create --spec .do/app.yaml` / `doctl apps update <id> --spec .do/app.yaml`.
+# Los valores marcados como SECRET se cargan en la UI (no se versionan).
+name: kommo-leads-unificador
+region: nyc
+services:
+  - name: api
+    github:
+      repo: CRMSERVICIOS/kommo_leads_unificador
+      branch: main
+      deploy_on_push: true
+    dockerfile_path: Dockerfile
+    http_port: 3000
+    # UNA sola instancia: los webhooks se procesan en una cola en memoria, en
+    # serie, para que dos eventos del mismo contacto no disparen dos fusiones.
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    health_check:
+      http_path: /health
+      # /health no consulta la base y el server escucha recien despues de las
+      # migraciones: 10s de gracia + 6 fallas seguidas antes de reiniciar.
+      initial_delay_seconds: 10
+      period_seconds: 10
+      timeout_seconds: 3
+      failure_threshold: 6
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        value: ${unificador-leads-db.DATABASE_URL}
+      - key: DATABASE_CA_CERT
+        scope: RUN_TIME
+        value: ${unificador-leads-db.CA_CERT}
+      - key: KOMMO_SUBDOMAIN
+        scope: RUN_TIME
+        value: rudas
+      - key: KOMMO_LONG_LIVED_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      - key: ADMIN_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      - key: DRY_RUN
+        scope: RUN_TIME
+        value: "true"
+      - key: DEFAULT_COUNTRY_CODE
+        scope: RUN_TIME
+        value: "54"
+databases:
+  - name: unificador-leads-db
+    engine: PG
+    production: true
+    cluster_name: unificador-leads-db

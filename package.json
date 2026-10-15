@@ -14,7 +14,8 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "test:db:up": "docker compose up -d --wait postgres",
     "backfill-index": "tsx src/jobs/backfillIndex.ts",
-    "reconcile-detections": "tsx src/jobs/reconcileDetections.ts"
+    "reconcile-detections": "tsx src/jobs/reconcileDetections.ts",
+    "audit-pipeline": "tsx scripts/audit-pipeline-14362171.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
